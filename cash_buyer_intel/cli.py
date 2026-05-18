@@ -294,6 +294,141 @@ def cmd_sync_county(market: str, portal: str, csv_path: str | None, agent: bool)
     )
 
 
+@main.command("enrich-sales")
+@click.option("--min-velocity", type=int, default=2,
+              help="only enrich entities with this velocity_12m or higher (saves API credits)")
+@click.option("--batch-size", type=int, default=50, help="BatchData accepts up to 100 per lookup call")
+@click.option("--limit", type=int, default=200, help="max addresses to enrich this run")
+@click.option("--agent", is_flag=True)
+def cmd_enrich_sales(min_velocity: int, batch_size: int, limit: int, agent: bool) -> None:
+    """Pull sale_date + sale_price for qualifying cash_sales via batchdata property lookup.
+
+    BatchData's search endpoint omits sale dates from the `core` dataset; the
+    per-property `lookup` endpoint includes `listing.soldDate`, `listing.bedroomCount`,
+    bath / year built, and `sale.priorSale.mortgages` (which confirms a paid-off
+    mortgage at the cash-sale point). Costs 1 credit per address.
+
+    Defaults to enriching only multi-property entities (velocity_12m >= 2) so we
+    aren't paying credits to confirm dates on one-off cash buyers.
+    """
+    batch_size = min(batch_size, 100)
+
+    with open_buyers(read_only=True) as conn:
+        rows = conn.execute(
+            """
+            SELECT cs.sale_id, cs.property_address,
+                   cs.zip_code, cs.city, cs.state,
+                   SUBSTR(cs.property_address, 1, INSTR(cs.property_address, ',') - 1) AS street
+              FROM cash_sales cs
+              JOIN buyer_scores bs ON bs.entity_id = cs.entity_id
+             WHERE bs.velocity_12m >= ?
+               AND (cs.sale_date IS NULL OR cs.sale_date = 'unknown')
+             LIMIT ?
+            """,
+            (min_velocity, limit),
+        ).fetchall()
+        targets = [dict(r) for r in rows]
+
+    if not targets:
+        _emit(agent, True, {"enriched": 0, "skipped": "no candidates"},
+              meta={"min_velocity": min_velocity})
+        return
+
+    enriched = 0
+    api_calls = 0
+    errors: list[str] = []
+
+    for i in range(0, len(targets), batch_size):
+        batch = targets[i:i + batch_size]
+        body = {"requests": [
+            {"address": {
+                "street": t["street"],
+                "city":   t["city"],
+                "state":  t["state"],
+                "zip":    t["zip_code"],
+            }}
+            for t in batch if t["street"]
+        ]}
+        if not body["requests"]:
+            continue
+
+        try:
+            proc = subprocess.run(
+                [_pp_bin("batchdata-pp-cli"), "property", "lookup", "--stdin", "--agent"],
+                input=json.dumps(body), check=True, capture_output=True, text=True, timeout=180,
+            )
+        except FileNotFoundError:
+            _emit(agent, False, None, errors=["batchdata-pp-cli not found"]); return
+        except subprocess.CalledProcessError as e:
+            errors.append(f"lookup batch failed: {e.stderr[:200]}")
+            continue
+
+        api_calls += 1
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError as e:
+            errors.append(f"parse error: {e}")
+            continue
+
+        props = ((payload.get("data") or {}).get("results") or {}).get("properties") or []
+        enriched += _apply_lookup_results(props, batch)
+
+    _emit(agent, True,
+          {"enriched": enriched, "candidates": len(targets), "api_calls": api_calls,
+           "estimated_credits_used": enriched},
+          errors=errors, meta={"min_velocity": min_velocity, "batch_size": batch_size})
+
+
+def _apply_lookup_results(props: list[dict], batch: list[dict]) -> int:
+    """Match property-lookup responses back to the requesting cash_sales rows and
+    update sale_date / sale_price / property_type."""
+    # Index responses by normalized property address for matching.
+    by_norm: dict[str, dict] = {}
+    for p in props:
+        addr = p.get("address") or {}
+        full = ", ".join(filter(None, [
+            addr.get("street"), addr.get("city"), addr.get("state"), addr.get("zip"),
+        ]))
+        by_norm[normalize_address(full)] = p
+
+    updated = 0
+    with open_buyers() as conn:
+        for t in batch:
+            anorm = normalize_address(t["property_address"])
+            p = by_norm.get(anorm)
+            if not p:
+                continue
+            listing = p.get("listing") or {}
+            sold = listing.get("soldDate")
+            sale = p.get("sale")
+            if isinstance(sale, list):
+                sale = sale[0] if sale else {}
+            elif not isinstance(sale, dict):
+                sale = {}
+            prior_mortgages = ((sale.get("priorSale") or {}).get("mortgages") or [])
+            # If no listing.soldDate, fall back to prior-sale recordingDate (when present).
+            sale_date = (sold or
+                         (prior_mortgages[0].get("recordingDate") if prior_mortgages else None))
+            if not sale_date:
+                continue
+            sale_price = listing.get("soldPrice") or listing.get("listPrice")
+            property_type = listing.get("propertyTypeDimension") or listing.get("homeType")
+
+            conn.execute(
+                """
+                UPDATE cash_sales
+                   SET sale_date     = ?,
+                       sale_price    = COALESCE(?, sale_price),
+                       property_type = COALESCE(?, property_type)
+                 WHERE sale_id = ?
+                """,
+                (sale_date[:10], sale_price, property_type, t["sale_id"]),
+            )
+            updated += 1
+        conn.commit()
+    return updated
+
+
 @main.command("enrich-batchdata")
 @click.option("--limit", type=int, default=200)
 @click.option("--agent", is_flag=True)
