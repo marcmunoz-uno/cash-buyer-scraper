@@ -11,11 +11,23 @@ PP CLIs own that.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 import click
+
+
+def _pp_bin(name: str) -> str:
+    """Resolve a PP CLI binary, checking $PATH then ~/go/bin (the standard
+    location for go-installed binaries that's often missing from $PATH)."""
+    return (
+        shutil.which(name)
+        or str(Path.home() / "go" / "bin" / name)
+    )
 
 from . import __version__
 from .db import (
@@ -71,134 +83,147 @@ def cmd_probe(agent: bool) -> None:
 
 
 @main.command("sync-attom")
-@click.option("--market", required=True, help='e.g. "St. Louis MO"')
-@click.option("--since", default="12m", help="duration window passed to attom-pp-cli sync")
-@click.option("--state", default=None)
-@click.option("--dry-run", is_flag=True)
 @click.option("--agent", is_flag=True)
-def cmd_sync_attom(market: str, since: str, state: str | None, dry_run: bool, agent: bool) -> None:
-    """Tier A. Pull cash sales from attom-pp-cli saleshistory into cash_sales."""
-    # The actual ATTOM sync is driven by `attom-pp-cli sync --since <since>` —
-    # invoked here so the call site is one place. After sync, we project
-    # cash-sale rows out of attom.attom_saleshistory.
-    if not dry_run:
-        try:
-            subprocess.run(
-                ["attom-pp-cli", "sync", "--since", since],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-        except FileNotFoundError:
-            _emit(agent, False, None, errors=["attom-pp-cli not found on PATH — install the PP CLI first"])
-            return
-        except subprocess.CalledProcessError as e:
-            _emit(agent, False, None, errors=[f"attom-pp-cli sync failed: {e.stderr.decode(errors='ignore')}"])
-            return
+def cmd_sync_attom(agent: bool) -> None:
+    """Tier A — ATTOM path. Blocked in v0.1: trial key returns 401 on /sale/snapshot.
 
-    inserted = _project_attom_to_cash_sales(market=market, state=state)
-    _emit(agent, True, {"market": market, "inserted_or_updated": inserted},
-          meta={"tier": "A", "source": "attom", "since": since, "dry_run": dry_run})
+    Wire-up details preserved for v0.2:
+      attom-pp-cli sale snapshot --postalcode <zip>
+        --startsalesearchdate YYYY-MM-DD --endsalesearchdate YYYY-MM-DD --agent
+      → returns per-sale records; project the ones with mortgage_amount = 0
+        into cash_sales (source='attom'). Bumps v0.1's buyer-coverage when
+        a working ATTOM key is available.
+    """
+    _emit(
+        agent, True,
+        {"status": "skipped", "reason": "ATTOM trial key returns 401; awaits paid key in v0.2"},
+        meta={"tier": "A", "source": "attom", "endpoint": "/sale/snapshot"},
+    )
 
 
-def _project_attom_to_cash_sales(market: str, state: str | None) -> int:
-    """SELECT cash sales from attached attom DB → UPSERT into main.cash_sales."""
-    n = 0
-    with open_buyers() as conn:
-        # Defensive: only run if attom is actually attached & has the expected table.
-        attached = {r["name"] for r in conn.execute("SELECT name FROM pragma_database_list").fetchall()}
-        if "attom" not in attached:
-            return 0
-
-        sql = """
-        INSERT OR REPLACE INTO cash_sales
-          (sale_id, property_address, property_address_norm, city, state, zip_code,
-           market, property_type, sale_date, sale_price, mortgage_amount,
-           buyer_name_raw, buyer_name_norm, buyer_mailing_addr, seller_name,
-           source, source_record_id, entity_id)
-        SELECT
-          'attom:' || COALESCE(s.transaction_id, hex(randomblob(8)))    AS sale_id,
-          p.address                                                      AS property_address,
-          norm_addr(p.address)                                           AS property_address_norm,
-          p.city, p.state, p.zip_code,
-          ?                                                              AS market,
-          p.property_type,
-          s.sale_date,
-          s.amount,
-          s.mortgage_amount,
-          COALESCE(s.buyer_name, '(unknown)')                            AS buyer_name_raw,
-          norm_buyer(COALESCE(s.buyer_name, ''))                         AS buyer_name_norm,
-          p.owner_address                                                AS buyer_mailing_addr,
-          s.seller_name,
-          'attom'                                                        AS source,
-          s.transaction_id                                               AS source_record_id,
-          NULL                                                           AS entity_id
-        FROM attom.attom_saleshistory s
-        JOIN attom.attom_property p ON p.attom_id = s.attom_id
-        WHERE (s.mortgage_amount IS NULL OR s.mortgage_amount = 0)
-          AND s.buyer_name IS NOT NULL
-        """
-        params: list = [market]
-        if state:
-            sql += " AND p.state = ?"
-            params.append(state)
-        cur = conn.execute(sql, params)
-        n = cur.rowcount
-        conn.commit()
-    return n
-
+# BatchData API body shape that this CLI actually accepts (validated live):
+#   {"searchCriteria": {"query": "<zip-or-text>",
+#                       "quickLists": ["cash-buyer", ...]},
+#    "options":        {"take": N, "skip": M}}
+# The MCP-server flat params (owner_name, property_zip, ...) are translated by
+# the MCP server, not the CLI; the CLI requires the API's native body shape.
 
 @main.command("sync-batchdata")
-@click.option("--market", required=True)
-@click.option("--cash-only/--no-cash-only", default=True)
-@click.option("--limit", type=int, default=500)
+@click.option("--query", required=True, help='e.g. "63116" or "Saint Louis MO" or "Cuyahoga County OH"')
+@click.option("--market", default=None, help="freeform market label written into cash_sales.market (defaults to --query)")
+@click.option("--quicklists", "quicklists_csv", default="cash-buyer",
+              help='comma-separated quickLists (kebab-case); default "cash-buyer". '
+                   'Use "cash-buyer,corporate-owned" to limit to LLCs.')
+@click.option("--limit", type=int, default=200, help="total records to fetch (paged in batches of 100)")
+@click.option("--page-size", type=int, default=100)
 @click.option("--agent", is_flag=True)
-def cmd_sync_batchdata(market: str, cash_only: bool, limit: int, agent: bool) -> None:
-    """Tier A. Search BatchData for cash buyers; cache results locally."""
-    # BatchData has no `sync`; we call `batchdata-pp-cli property search` with the
-    # cash_buyer filter and UPSERT into batchdata_cache. The CLI returns JSON via
-    # --agent.
-    try:
-        proc = subprocess.run(
-            [
-                "batchdata-pp-cli", "property", "search",
-                "--market", market,
-                "--cash-buyer", str(cash_only).lower(),
-                "--limit", str(limit),
-                "--agent",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError:
-        _emit(agent, False, None, errors=["batchdata-pp-cli not found on PATH"])
-        return
-    except subprocess.CalledProcessError as e:
-        _emit(agent, False, None, errors=[f"batchdata-pp-cli search failed: {e.stderr}"])
-        return
+def cmd_sync_batchdata(query: str, market: str | None, quicklists_csv: str,
+                       limit: int, page_size: int, agent: bool) -> None:
+    """Tier A. Pull cash buyers from BatchData → batchdata_cache + cash_sales."""
+    market = market or query
+    quicklists = [q.strip() for q in quicklists_csv.split(",") if q.strip()]
+    page_size = min(page_size, 100)  # BatchData hard cap
 
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError as e:
-        _emit(agent, False, None, errors=[f"could not parse batchdata response: {e}"])
-        return
+    fetched: list[dict] = []
+    skip = 0
+    while len(fetched) < limit:
+        take = min(page_size, limit - len(fetched))
+        body = {
+            "searchCriteria": {"query": query, "quickLists": quicklists},
+            "options":        {"take": take, "skip": skip},
+        }
+        try:
+            proc = subprocess.run(
+                [_pp_bin("batchdata-pp-cli"), "property", "search",
+                 "--search-criteria", json.dumps(body["searchCriteria"]),
+                 "--options",         json.dumps(body["options"]),
+                 "--agent"],
+                check=True, capture_output=True, text=True, timeout=180,
+            )
+        except FileNotFoundError:
+            _emit(agent, False, None,
+                  errors=["batchdata-pp-cli not found on PATH (check ~/go/bin)"])
+            return
+        except subprocess.CalledProcessError as e:
+            _emit(agent, False, None,
+                  errors=[f"batchdata-pp-cli search failed (skip={skip}): {e.stderr[:300]}"])
+            return
 
-    rows = payload.get("data", []) if isinstance(payload, dict) else []
-    cached, projected = _store_batchdata_results(rows, market=market)
-    _emit(agent, True, {"cached": cached, "projected_to_cash_sales": projected},
-          meta={"tier": "A", "source": "batchdata", "market": market, "limit": limit})
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError as e:
+            _emit(agent, False, None,
+                  errors=[f"could not parse batchdata response: {e}; head={proc.stdout[:200]}"])
+            return
+
+        results = (payload.get("data") or {}).get("results") or {}
+        props = results.get("properties") or []
+        if not props:
+            break
+        fetched.extend(props)
+        meta = (results.get("meta") or {}).get("results") or {}
+        # Stop early if we've exhausted the result set.
+        if skip + len(props) >= int(meta.get("resultsFound", 0)):
+            break
+        skip += len(props)
+
+    cached, projected = _store_batchdata_results(fetched, market=market)
+    _emit(agent, True,
+          {"cached": cached, "projected_to_cash_sales": projected, "fetched": len(fetched)},
+          meta={"tier": "A", "source": "batchdata", "query": query,
+                "quicklists": quicklists, "limit": limit})
 
 
 def _store_batchdata_results(rows: list[dict], market: str) -> tuple[int, int]:
+    """Insert BatchData property records into batchdata_cache + cash_sales.
+
+    Mapping (BatchData core dataset → cash_sales):
+      address.street/city/state/zip → property_address / city / state / zip_code
+      owner.fullName                → buyer_name_raw
+      owner.mailingAddress.{...}    → buyer_mailing_addr (joined string)
+      quickLists.cashBuyer          → must be True to insert (defensive)
+      openLien.totalOpenLienCount==0 → free-and-clear validation
+      sale.lastSaleDate/Price       → sale_date / sale_price (often empty in core)
+      mortgage history              → mortgage_amount = 0 if list empty
+    """
     cached = 0
     projected = 0
     with open_buyers() as conn:
-        for r in rows:
-            addr = r.get("address") or ""
-            if not addr:
+        for p in rows:
+            addr = p.get("address") or {}
+            street = addr.get("street")
+            if not street:
                 continue
-            anorm = normalize_address(addr)
+            full_addr = ", ".join(filter(None, [
+                street,
+                addr.get("city"),
+                addr.get("state"),
+                addr.get("zip"),
+            ]))
+            anorm = normalize_address(full_addr)
+
+            ql = p.get("quickLists") or {}
+            owner = p.get("owner") or {}
+            owner_name = owner.get("fullName")
+            owner_mail = owner.get("mailingAddress") or {}
+            owner_mail_str = ", ".join(filter(None, [
+                owner_mail.get("street"),
+                owner_mail.get("city"),
+                owner_mail.get("state"),
+                owner_mail.get("zip"),
+            ])) or None
+            phones = p.get("phoneNumbers") or []
+            primary_phone = phones[0].get("number") if phones and isinstance(phones[0], dict) else None
+
+            sale = p.get("sale")
+            if isinstance(sale, list):
+                sale = sale[0] if sale else {}
+            elif not isinstance(sale, dict):
+                sale = {}
+
+            is_cash = bool(ql.get("cashBuyer"))
+            open_lien_count = ((p.get("openLien") or {}).get("totalOpenLienCount") or 0)
+
             conn.execute(
                 """
                 INSERT OR REPLACE INTO batchdata_cache
@@ -206,38 +231,46 @@ def _store_batchdata_results(rows: list[dict], market: str) -> tuple[int, int]:
                    owner_name, owner_state)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    anorm,
-                    json.dumps(r),
-                    r.get("primary_phone"),
-                    1 if r.get("is_cash_buyer") else 0,
-                    r.get("owner_name"),
-                    r.get("owner_state"),
-                ),
+                (anorm, json.dumps(p), primary_phone,
+                 1 if is_cash else 0,
+                 owner_name, owner_mail.get("state")),
             )
             cached += 1
 
-            if r.get("last_cash_sale_date") and r.get("owner_name"):
-                sale_id = "batchdata:" + anorm + ":" + r["last_cash_sale_date"]
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO cash_sales
-                      (sale_id, property_address, property_address_norm, city, state, zip_code,
-                       market, property_type, sale_date, sale_price, mortgage_amount,
-                       buyer_name_raw, buyer_name_norm, buyer_mailing_addr, seller_name,
-                       source, source_record_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, 'batchdata', ?)
-                    """,
-                    (
-                        sale_id, addr, anorm,
-                        r.get("city"), r.get("state"), r.get("zip_code"),
-                        market, r.get("property_type"),
-                        r.get("last_cash_sale_date"), r.get("last_cash_sale_price"),
-                        r["owner_name"], normalize_buyer_name(r["owner_name"]),
-                        r.get("owner_mailing_address"), r.get("batch_id"),
-                    ),
-                )
-                projected += 1
+            # Only project as a cash_sale if the buyer name is present AND the
+            # cash-buyer signal is true. (We trust BatchData's flag over the
+            # mortgage check — they sometimes co-exist if an old lien remained.)
+            if not (is_cash and owner_name):
+                continue
+
+            sale_date = sale.get("lastSaleDate") or ""
+            sale_price = sale.get("lastSalePrice")
+            sale_id = f"batchdata:{anorm}:{sale_date or 'unknown'}"
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO cash_sales
+                  (sale_id, property_address, property_address_norm, city, state, zip_code,
+                   market, property_type, sale_date, sale_price, mortgage_amount,
+                   buyer_name_raw, buyer_name_norm, buyer_mailing_addr, seller_name,
+                   source, source_record_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'batchdata', ?)
+                """,
+                (
+                    sale_id, full_addr, anorm,
+                    addr.get("city"), addr.get("state"), addr.get("zip"),
+                    market,
+                    (p.get("building") or {}).get("propertyType")
+                        or (p.get("listing") or {}).get("propertyTypeDetail"),
+                    sale_date[:10] if sale_date else "unknown",
+                    sale_price,
+                    0 if open_lien_count == 0 else None,
+                    owner_name, normalize_buyer_name(owner_name),
+                    owner_mail_str,
+                    p.get("_id"),
+                ),
+            )
+            projected += 1
         conn.commit()
     return cached, projected
 
@@ -285,7 +318,7 @@ def cmd_enrich_batchdata(limit: int, agent: bool) -> None:
         addr = t["buyer_mailing_addr"]
         try:
             proc = subprocess.run(
-                ["batchdata-pp-cli", "property", "skip-trace", "--address", addr, "--agent"],
+                [_pp_bin("batchdata-pp-cli"), "property", "skip-trace", "--address", addr, "--agent"],
                 check=True, capture_output=True, text=True,
             )
         except (FileNotFoundError, subprocess.CalledProcessError):
@@ -468,7 +501,7 @@ def cmd_push_tranchi(top: int, market: str | None, dry_run: bool, agent: bool) -
         for r in rows:
             try:
                 subprocess.run(
-                    ["tranchi-pp-cli", "cash-buyers", "upload",
+                    [_pp_bin("tranchi-pp-cli"), "cash-buyers", "upload",
                      "--external-id", r["entity_id"],
                      "--name", r["canonical_name"],
                      "--phone", r.get("primary_phone") or "",

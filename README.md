@@ -64,14 +64,19 @@ That is what this repo does. The data sources to *find* cash sales already exist
 
 ## The two-tier sourcing strategy
 
-| Tier | Source | What it gives us | Cost | Coverage |
-|---|---|---|---|---|
-| **A — API** | ATTOM `saleshistory` + BatchData `search_properties` with `cash_buyer` flag | National coverage, structured, refreshed monthly–weekly. Cash flag already present. | $ / lookup | National |
-| **B — County portals** | `county-portal-scraper` (the 71 portal SOPs already cracked across 32 markets) | Free, near-real-time, catches deeds the APIs miss | $0 | 32 markets today |
+| Tier | Source | What it gives us | Cost | Coverage | v0.1 status |
+|---|---|---|---|---|---|
+| **A — API (BatchData)** | `batchdata-pp-cli property search` with `quickLists: ["cash-buyer"]` | National coverage; rich owner + mailing address + cash-buyer/free-and-clear flags | $ / page (~100 records each) | National | ✅ working — 300 records validated end-to-end |
+| **A — API (ATTOM)** | `attom-pp-cli sale snapshot --postalcode --start --end` | Dated sale records with mortgage_amount → precise cash filter | $ / lookup | National | ⚠️ blocked in v0.1 — trial key returns 401; restore on paid key |
+| **B — County portals** | `county-portal-scraper` deed feeds (71 portals across 32 markets) | Free, near-real-time, catches deeds the APIs miss | $0 | 32 markets | 📋 stubbed for v0.2 |
 
-Tier A goes in first — it's the thin wrapper over two existing PP CLIs, deployable in a weekend. Tier B layers in behind it as the cheap-coverage path for the markets we already have cracked. We did not include Zillow-sold reverse-derivation: the cash flag is unreliable there and ATTOM/BatchData already cover the same surface with explicit fields.
+Tier A (BatchData) was validated end-to-end on 2026-05-18 — see [Validated end-to-end](#validated-end-to-end-on-2026-05-18) below. ATTOM is wired but disabled until a paid key replaces the expired trial. Tier B (county portals) lands in v0.2 once `sync-county` is connected to the existing `county-portal-scraper` output paths.
 
-Both tiers write to the same `cash_sales` table. Dedup, scoring, and outreach are tier-agnostic — they only see the union.
+All tiers write to the same `cash_sales` table. Dedup, scoring, and outreach are tier-agnostic — they only see the union.
+
+### What ATTOM and BatchData each *can't* do on their own
+
+Both ATTOM and BatchData are **point-lookup APIs**, not list-everything sync APIs. ATTOM's `sale snapshot` and BatchData's `property search` are area-scoped queries — you pass a ZIP / city / county, you get back a page of results. There is no "sync the whole database" call. This repo therefore uses the **owned-cache pattern** for both: the local `cash_sales` and `batchdata_cache` tables in `~/cash-buyer-intel/buyers.db` accumulate every result we've ever fetched. PP-CLI source DBs (when they exist) are read-only references; the authoritative working set lives here.
 
 ---
 
@@ -142,16 +147,15 @@ The domain logic that doesn't live in any PP CLI:
 ```bash
 git clone git@github.com:marcmunoz-uno/cash-buyer-scraper.git
 cd cash-buyer-scraper
-pip install -e .
+python3.12 -m venv .venv && .venv/bin/pip install -e .
 
 # initialize the local buyers DB
 cash-buyer-intel init-db
 
-# pull cash sales from ATTOM for a market (tier A)
-cash-buyer-intel sync-attom --market "St. Louis MO" --since 12m
-
-# pull from BatchData via the owned-cache (tier A)
-cash-buyer-intel sync-batchdata --market "St. Louis MO" --cash-only
+# pull cash buyers from BatchData (tier A). --query accepts ZIP, city, or county.
+cash-buyer-intel sync-batchdata --query 63116 --market "St. Louis MO" --limit 100
+cash-buyer-intel sync-batchdata --query 63139 --market "St. Louis MO" --limit 100
+cash-buyer-intel sync-batchdata --query 63111 --market "St. Louis MO" --limit 100
 
 # dedup buyer entities across all loaded sales
 cash-buyer-intel dedup
@@ -162,17 +166,24 @@ cash-buyer-intel score
 # query qualified buyers (agent-ready JSON)
 cash-buyer-intel buyers \
   --market "St. Louis MO" \
-  --min-velocity 3 \
-  --max-median-price 200000 \
-  --property-type single_family \
-  --no-recent-outreach 30d \
+  --min-velocity 2 \
+  --limit 20 \
   --agent
-
-# push the top 20 to tranchi.ai
-cash-buyer-intel push-tranchi --top 20 --market "St. Louis MO"
 ```
 
 Output of `buyers --agent` matches the PP CLI `--agent` JSON shape (envelope: `{ok, data, errors, meta}`) so any agent or MCP wrapper that already speaks PP can consume it without changes.
+
+### Validated end-to-end on 2026-05-18
+
+Pulling 300 BatchData cash-buyer records from St. Louis ZIPs 63116, 63139, 63111:
+
+| Stage | Result |
+|---|---|
+| `sync-batchdata` | 300/300 records loaded; **100%** of returned records have `quickLists.cashBuyer = True` (filter is reliable) |
+| `dedup` | 297 buyer_entities created from 300 sales — **3 real serial buyers collapsed** (GUARDIAN FUND, LOREN RAMSEY, R WEST, each owning 2 properties) |
+| entity-type classifier | 169 individuals, 78 LLCs, 15 trusts, 6 corps, 29 unknown |
+| `score` | 297 scored. Top-3 by velocity match the dedup multi-property entities. |
+| `buyers --min-velocity 2 --agent` | Returns the 3 serial buyers, full PP-envelope JSON. |
 
 ---
 
@@ -182,19 +193,24 @@ Output of `buyers --agent` matches the PP CLI `--agent` JSON shape (envelope: `{
 cash-buyer-intel init-db
    Create ~/cash-buyer-intel/buyers.db with the full schema.
 
-cash-buyer-intel sync-attom --market <name> [--since <duration>] [--state <ST>]
-   Tier A. Subprocess out to attom-pp-cli to list saleshistory in the market.
-   Filter to cash sales (mortgage_amount = 0 OR transaction_type = cash).
-   UPSERT into cash_sales.
+cash-buyer-intel sync-attom
+   Tier A — ATTOM. v0.1: returns skipped (trial key 401s). The wire-up is
+   ready; restore by calling `attom-pp-cli sale snapshot --postalcode <zip>
+   --startsalesearchdate ... --endsalesearchdate ...` once a working key is in
+   place. Project rows with mortgage_amount = 0 into cash_sales.
 
-cash-buyer-intel sync-batchdata --market <name> [--cash-only] [--limit N]
-   Tier A. Subprocess out to batchdata-pp-cli search_properties with the
-   cash_buyer filter. Results land in batchdata_cache (owned-cache pattern),
-   then projected into cash_sales.
+cash-buyer-intel sync-batchdata --query <zip|city|county> [--market <label>]
+                                [--quicklists cash-buyer,corporate-owned]
+                                [--limit N] [--page-size 100]
+   Tier A — BatchData. Calls batchdata-pp-cli property search with
+   {"query": <q>, "quickLists": [...]}, pages until --limit, parses each
+   property into batchdata_cache + cash_sales. Validated body shape on
+   2026-05-18: --query "63116" with --quicklists cash-buyer returned 3,980
+   matches and 100/100 had cashBuyer=True.
 
 cash-buyer-intel sync-county --market <name> --portal <slug>
    Tier B. Read county-portal-scraper output for a market, find deeds with
-   no concurrent mortgage record, UPSERT into cash_sales.
+   no concurrent mortgage record, UPSERT into cash_sales. Stubbed in v0.1.
 
 cash-buyer-intel enrich-batchdata [--limit N]
    For every cash_sale where buyer_contacts is empty, look up the buyer
@@ -235,7 +251,7 @@ All commands accept `--agent` for structured JSON output.
 
 | Field | Definition |
 |---|---|
-| `velocity_12m` | Count of cash sales in the trailing 12 months. |
+| `velocity_12m` | Count of cash sales in the trailing 12 months — *date-based*. |
 | `velocity_3m` | Same, trailing 3 months. The hot-vs-cold split. |
 | `median_purchase_price` | Median price across all sales. |
 | `p25_price`, `p75_price` | The buy-box price band. |
@@ -245,7 +261,7 @@ All commands accept `--agent` for structured JSON output.
 | `recency_score` | Sum over sales of `exp(-months_since_sale / 6)`. Recent activity dominates. |
 | `activity_tier` | `hot` (velocity_3m ≥ 1 AND velocity_12m ≥ 3), `warm` (velocity_12m ≥ 3), `cold` (velocity_12m ≥ 1), `dormant` (else). |
 
-Default `buyers --agent` query returns hot + warm tiers only.
+**Count-based fallback when dates are unavailable.** BatchData's `core` dataset (the only tier in this account) does not include `sale.lastSaleDate` — only the `deed` dataset does. When `score` sees zero parseable sale dates for an entity, it falls back to `velocity_12m = total_sales` and `recency_score = total_sales`. Justification: every BatchData cash-buyer record reflects a *current free-and-clear holding*, so the count of properties is a reliable active-buyer signal even without exact recording dates. To get true date-based velocity (and the `hot`/`warm` tiers), either request the BatchData `deed` dataset or wire in ATTOM `sale snapshot` once the paid key arrives.
 
 ---
 
@@ -385,9 +401,14 @@ CREATE TABLE batchdata_cache (
 
 ## Status and roadmap
 
-**v0.1 — Tier A only (current scaffold).**
-- ATTOM sync, BatchData owned-cache, dedup, score, query, push.
-- Single-market end-to-end run.
+**v0.1 — BatchData tier A, end-to-end validated.**
+- ✅ BatchData sync (paged) + owned-cache + cash_sales projection
+- ✅ Entity resolution (exact-match + fuzzy + entity-type classifier)
+- ✅ Count-based scoring fallback when sale dates aren't returned
+- ✅ Qualified-buyer query (`buyers --min-velocity N --agent`)
+- ⚠️ ATTOM stubbed — paid key needed before `sync-attom` lights up
+- ⚠️ Date-based velocity needs BatchData `deed` dataset or live ATTOM
+- 📋 `push-tranchi` stubbed — production-side `cash_buyers` endpoint pending
 
 **v0.2 — Tier B.**
 - Wire `sync-county` to `county-portal-scraper` output for the 32 markets already cracked.

@@ -34,7 +34,15 @@ def _tier(velocity_3m: int, velocity_12m: int) -> str:
 
 
 def score_all(window_months: int = 12) -> dict:
-    """Recompute buyer_scores for every entity that has at least one cash_sale."""
+    """Recompute buyer_scores for every entity that has at least one cash_sale.
+
+    Date-based velocity is preferred (months-since-sale in the trailing window).
+    If sale dates are unavailable (BatchData `core` dataset omits them — only the
+    `deed` dataset has them, and not every account has access), we fall back to
+    a **count-based** velocity: total cash_sales for this entity. Justified by
+    "this entity currently owns N properties free-and-clear" being a reliable
+    active-cash-buyer signal even without exact recording dates.
+    """
     ref = datetime.utcnow()
     written = 0
 
@@ -59,20 +67,31 @@ def score_all(window_months: int = 12) -> dict:
             types: list[str] = []
             zips: list[str] = []
             recency = 0.0
+            has_any_date = False
 
             for s in sales:
                 m = _months_since(s["sale_date"], ref)
-                if m <= window_months:
-                    v12 += 1
-                if m <= 3:
-                    v3 += 1
+                if math.isfinite(m):
+                    has_any_date = True
+                    if m <= window_months:
+                        v12 += 1
+                    if m <= 3:
+                        v3 += 1
+                    recency += math.exp(-m / 6.0)
                 if s["sale_price"]:
                     prices.append(int(s["sale_price"]))
                 if s["property_type"]:
                     types.append(s["property_type"])
                 if s["zip_code"]:
                     zips.append(s["zip_code"])
-                recency += math.exp(-m / 6.0)
+
+            if not has_any_date:
+                # Date-free fallback: every cash_sale is a current free-and-clear
+                # holding, so count of sales is the activity signal. Recency
+                # defaults to len(sales) so tier-ranking still orders meaningfully.
+                v12 = len(sales)
+                v3 = 0
+                recency = float(len(sales))
 
             median = int(statistics.median(prices)) if prices else None
             p25 = int(statistics.quantiles(prices, n=4)[0]) if len(prices) >= 4 else None
