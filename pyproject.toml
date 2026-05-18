@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cash-buyer-intel"
+version = "0.1.0"
+description = "Cash-buyer discovery mesh — sources all-cash settlements from county records and PP-CLI data, dedupes buyer entities, scores velocity, pushes qualified buyers to tranchi.ai."
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+dependencies = [
+    "click>=8.1",
+]
+
+[project.scripts]
+cash-buyer-intel = "cash_buyer_intel.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cash_buyer_intel*"]

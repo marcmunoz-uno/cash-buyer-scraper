@@ -1,0 +1,30 @@
+# Local SQLite — never check in scraped or third-party data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Secrets
+.env
+.env.*
+.secrets/
+*.token
+api_token
