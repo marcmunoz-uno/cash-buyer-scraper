@@ -425,6 +425,13 @@ cash-buyer-intel ingest-propstream \
 - ⚠️ Date-based velocity needs BatchData `deed` dataset or live ATTOM
 - 📋 `push-tranchi` stubbed — production-side `cash_buyers` endpoint pending
 
+**v0.5 — Wichita 1000 + SOP virtual-scroll fix (validated 2026-05-19).**
+- ✅ 1,000 Vacant + High-Equity records pulled from Wichita via BatchData (3 paginated calls × ~333 records)
+- ✅ 991/1000 photo-enriched via the waterfall (Street View 4 + Esri aerial 2 = 6/property)
+- ✅ **370 properties on tranchi.ai backfilled with photos** (existing leads + new image_urls via /api/leads/enrich)
+- ✅ Schema: `motivated_sellers.latitude` / `longitude` columns store coords from BatchData → skips Census geocode round-trip on subsequent enrichment runs
+- 📋 **SOP fix documented**: [`docs/propstream/cdp-list-id-capture.md`](docs/propstream/cdp-list-id-capture.md) — captures the new list's ID from the Save POST response via CDP Network domain, bypasses the virtual-scrolled sidebar. Implementation pattern + caveats included.
+
 **v0.4 — photo-enrichment-pipeline integration + tranchi backfill (validated 2026-05-19).**
 - ✅ `enrich-photos` now uses [`photo-enrichment-pipeline`](https://github.com/marcmunoz-uno/photo-enrichment-pipeline)'s `fetch_photos_waterfall` — Zillow → Street View → Esri aerial. Graceful per-source skipping with `--no-zillow` / `--no-street-view` / `--no-esri`.
 - ✅ `tranchi-backfill-photos` thin wrapper around the library's `tranchi-backfill` CLI — POSTs `{address, image_urls}` to `/api/leads/enrich` for addresses tranchi already has but lacks photos for.
