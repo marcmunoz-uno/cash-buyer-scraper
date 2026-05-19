@@ -425,6 +425,12 @@ cash-buyer-intel ingest-propstream \
 - ⚠️ Date-based velocity needs BatchData `deed` dataset or live ATTOM
 - 📋 `push-tranchi` stubbed — production-side `cash_buyers` endpoint pending
 
+**v0.9 — Full 3,600 pipeline run; tranchi /api/leads/enrich hits per-window rate-limit.**
+- ✅ Enrichment finished: 3,457/3,600 photo-enriched, **1,334 Zillow-primary** + 2,123 Street View / Esri fallback
+- ✅ Total photo URLs collected: 43,001 Zillow + 9,469 Street View + 4,709 Esri = **57,179** (~16 per property on Zillow primaries)
+- ⚠️ tranchi.ai `/api/leads/enrich` rate-limits HARD: ~600 records per window before HTTP 429 with retryAfter=3,332-3,333 s (~55 min). The 4,109 backfill split across multiple windows. Cumulative tranchi updates this session: ~2,360 leads.
+- 📋 Backfill is scheduled to resume in ~46 min when the rate-limit window clears (see `ScheduleWakeup`)
+
 **v0.8 — 3,600-property multi-market pull → 1,660 photos backfilled to tranchi (validated 2026-05-19).**
 - ✅ Pulled 3,600 `failed-listing` records from BatchData across Wichita / Kansas City / Saint Louis / Memphis / Cleveland (70% have `listing.listingUrl` → eligible for Zillow stage)
 - ✅ Photo waterfall ran across the full set with 8 concurrent workers. **91% Zillow success rate** on the listing_url subset that completed; ~6/min throughput sustained over a ~30 min run
