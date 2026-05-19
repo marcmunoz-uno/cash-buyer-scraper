@@ -569,8 +569,9 @@ def cmd_ingest_batchdata_sellers(json_glob: str, lead_type: str, market: str, ag
                        total_open_loans, est_remaining_balance, est_value,
                        last_sale_date, last_sale_amount,
                        owner_name_raw, owner_name_norm, owner_mailing_addr, owner_occupied,
+                       latitude, longitude,
                        source, source_record_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'batchdata', ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'batchdata', ?)
                     """,
                     (lead_id, full_addr, anorm,
                      addr.get("city"), addr.get("state"), addr.get("zip"),
@@ -583,6 +584,7 @@ def cmd_ingest_batchdata_sellers(json_glob: str, lead_type: str, market: str, ag
                      int(sale.get("lastSalePrice")) if sale.get("lastSalePrice") else None,
                      owner_name, normalize_buyer_name(owner_name),
                      mailing, 1 if ql.get("ownerOccupied") else (0 if "ownerOccupied" in ql else None),
+                     addr.get("latitude"), addr.get("longitude"),
                      p.get("_id")),
                 )
                 inserted += 1
@@ -651,7 +653,7 @@ def cmd_enrich_photos(source_table: str, market: str | None, limit: int, min_pho
         if source_table == "motivated_sellers":
             sql = f"""
                 SELECT m.property_address_norm AS address_norm, m.property_address AS full_addr,
-                       m.city, m.state, m.zip_code
+                       m.city, m.state, m.zip_code, m.latitude, m.longitude
                   FROM motivated_sellers m
              LEFT JOIN property_photos pp ON pp.address_norm = m.property_address_norm
                  WHERE pp.address_norm IS NULL AND {where}
@@ -660,7 +662,8 @@ def cmd_enrich_photos(source_table: str, market: str | None, limit: int, min_pho
         else:
             sql = f"""
                 SELECT cs.property_address_norm AS address_norm, cs.property_address AS full_addr,
-                       cs.city, cs.state, cs.zip_code
+                       cs.city, cs.state, cs.zip_code,
+                       NULL AS latitude, NULL AS longitude
                   FROM cash_sales cs
              LEFT JOIN property_photos pp ON pp.address_norm = cs.property_address_norm
                  WHERE pp.address_norm IS NULL AND {where}
@@ -686,6 +689,10 @@ def cmd_enrich_photos(source_table: str, market: str | None, limit: int, min_pho
             city=row.get("city") or "",
             state=row.get("state") or "",
             zip_code=str(row.get("zip_code") or ""),
+            # Pre-supplied coords skip the slow Census geocoder round-trip
+            # (~3-5s/property → near-zero when lat/lon are provided).
+            lat=row.get("latitude"),
+            lon=row.get("longitude"),
             target_photos=target_photos,
             enable_zillow=not no_zillow,
             enable_street_view=not no_street_view,

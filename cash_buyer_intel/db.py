@@ -288,6 +288,8 @@ CREATE TABLE IF NOT EXISTS motivated_sellers (
     owner_name_norm      TEXT NOT NULL,
     owner_mailing_addr   TEXT,
     owner_occupied       INTEGER,                     -- 0/1
+    latitude             REAL,                        -- geocoded coords from source
+    longitude            REAL,                        --   skip Census geocode round-trip in enrich-photos
     source               TEXT NOT NULL,               -- 'propstream' for now; future: 'county-portal-direct'
     source_record_id     TEXT,                        -- PropStream APN or other stable id
     loaded_at            TEXT NOT NULL DEFAULT (datetime('now'))
