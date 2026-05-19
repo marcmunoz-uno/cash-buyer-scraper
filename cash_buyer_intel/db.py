@@ -290,6 +290,7 @@ CREATE TABLE IF NOT EXISTS motivated_sellers (
     owner_occupied       INTEGER,                     -- 0/1
     latitude             REAL,                        -- geocoded coords from source
     longitude            REAL,                        --   skip Census geocode round-trip in enrich-photos
+    listing_url          TEXT,                        -- Zillow PDP URL from BatchData (enables Zillow stage of photo waterfall)
     source               TEXT NOT NULL,               -- 'propstream' for now; future: 'county-portal-direct'
     source_record_id     TEXT,                        -- PropStream APN or other stable id
     loaded_at            TEXT NOT NULL DEFAULT (datetime('now'))

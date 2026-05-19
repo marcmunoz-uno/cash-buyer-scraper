@@ -558,6 +558,10 @@ def cmd_ingest_batchdata_sellers(json_glob: str, lead_type: str, market: str, ag
                          or ((p.get("mortgageHistory") or [{}])[0].get("loanAmount") if p.get("mortgageHistory") else None))
                 last_sold = listing.get("soldDate") or sale.get("lastSaleDate")
                 property_type_raw = listing.get("propertyType")  # 'SINGLE_FAMILY' etc.
+                # Zillow PDP URL — enables the Zillow stage of the photo waterfall
+                listing_url_zillow = listing.get("listingUrl") or None
+                if listing_url_zillow and "zillow.com/homedetails" not in listing_url_zillow:
+                    listing_url_zillow = None
 
                 lead_id = "bd_" + hashlib.sha1(f"{anorm}|{lead_type}".encode()).hexdigest()[:16]
 
@@ -569,9 +573,9 @@ def cmd_ingest_batchdata_sellers(json_glob: str, lead_type: str, market: str, ag
                        total_open_loans, est_remaining_balance, est_value,
                        last_sale_date, last_sale_amount,
                        owner_name_raw, owner_name_norm, owner_mailing_addr, owner_occupied,
-                       latitude, longitude,
+                       latitude, longitude, listing_url,
                        source, source_record_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'batchdata', ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'batchdata', ?)
                     """,
                     (lead_id, full_addr, anorm,
                      addr.get("city"), addr.get("state"), addr.get("zip"),
@@ -584,7 +588,7 @@ def cmd_ingest_batchdata_sellers(json_glob: str, lead_type: str, market: str, ag
                      int(sale.get("lastSalePrice")) if sale.get("lastSalePrice") else None,
                      owner_name, normalize_buyer_name(owner_name),
                      mailing, 1 if ql.get("ownerOccupied") else (0 if "ownerOccupied" in ql else None),
-                     addr.get("latitude"), addr.get("longitude"),
+                     addr.get("latitude"), addr.get("longitude"), listing_url_zillow,
                      p.get("_id")),
                 )
                 inserted += 1
@@ -653,7 +657,7 @@ def cmd_enrich_photos(source_table: str, market: str | None, limit: int, min_pho
         if source_table == "motivated_sellers":
             sql = f"""
                 SELECT m.property_address_norm AS address_norm, m.property_address AS full_addr,
-                       m.city, m.state, m.zip_code, m.latitude, m.longitude
+                       m.city, m.state, m.zip_code, m.latitude, m.longitude, m.listing_url
                   FROM motivated_sellers m
              LEFT JOIN property_photos pp ON pp.address_norm = m.property_address_norm
                  WHERE pp.address_norm IS NULL AND {where}
@@ -663,7 +667,7 @@ def cmd_enrich_photos(source_table: str, market: str | None, limit: int, min_pho
             sql = f"""
                 SELECT cs.property_address_norm AS address_norm, cs.property_address AS full_addr,
                        cs.city, cs.state, cs.zip_code,
-                       NULL AS latitude, NULL AS longitude
+                       NULL AS latitude, NULL AS longitude, NULL AS listing_url
                   FROM cash_sales cs
              LEFT JOIN property_photos pp ON pp.address_norm = cs.property_address_norm
                  WHERE pp.address_norm IS NULL AND {where}
@@ -693,6 +697,8 @@ def cmd_enrich_photos(source_table: str, market: str | None, limit: int, min_pho
             # (~3-5s/property → near-zero when lat/lon are provided).
             lat=row.get("latitude"),
             lon=row.get("longitude"),
+            # Zillow PDP URL — without this, the Zillow stage no-ops.
+            listing_url=row.get("listing_url"),
             target_photos=target_photos,
             enable_zillow=not no_zillow,
             enable_street_view=not no_street_view,
