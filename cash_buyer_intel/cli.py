@@ -488,6 +488,374 @@ def cmd_ingest_propstream_list(xlsx_path: str, lead_type: str, market: str | Non
           meta={"source": "propstream", "xlsx": xlsx_path})
 
 
+@main.command("ingest-batchdata-sellers")
+@click.argument("json_glob", type=str)
+@click.option("--lead-type", required=True,
+              type=click.Choice(["pre-foreclosure", "vacant", "absentee", "high-equity",
+                                 "tired-landlord", "probate", "tax-default",
+                                 "vacant-equity-absentee", "other"]))
+@click.option("--market", required=True)
+@click.option("--agent", is_flag=True)
+def cmd_ingest_batchdata_sellers(json_glob: str, lead_type: str, market: str, agent: bool) -> None:
+    """Ingest batchdata-pp-cli property search JSON output(s) into motivated_sellers.
+
+    Accepts a glob of JSON files (one per paginated batchdata response).
+    Same parsing pattern as sync-batchdata but writes to motivated_sellers
+    instead of cash_sales (since these are seller-side leads).
+    """
+    import glob as _glob
+    import hashlib
+    files = sorted(_glob.glob(json_glob))
+    if not files:
+        _emit(agent, False, None, errors=[f"no files match: {json_glob}"]); return
+
+    inserted = 0
+    skipped = 0
+    seen: set[str] = set()
+
+    with open_buyers() as conn:
+        for f in files:
+            payload = json.load(open(f))
+            props = ((payload.get("data") or {}).get("results") or {}).get("properties") or []
+            for p in props:
+                addr = p.get("address") or {}
+                street = addr.get("street")
+                if not street:
+                    skipped += 1; continue
+                full_addr = ", ".join(filter(None, [
+                    street, addr.get("city"), addr.get("state"), addr.get("zip"),
+                ]))
+                anorm = normalize_address(full_addr)
+                if anorm in seen:
+                    skipped += 1; continue
+                seen.add(anorm)
+
+                owner = p.get("owner") or {}
+                owner_name = owner.get("fullName") or "(unknown)"
+                owner_mail = owner.get("mailingAddress") or {}
+                mailing = ", ".join(filter(None, [
+                    owner_mail.get("street"), owner_mail.get("city"),
+                    owner_mail.get("state"), owner_mail.get("zip"),
+                ])) or None
+
+                ql = p.get("quickLists") or {}
+                distress = ",".join(k for k, v in ql.items() if v is True)
+
+                open_lien = p.get("openLien") or {}
+                sale = p.get("sale")
+                if isinstance(sale, list):
+                    sale = sale[0] if sale else {}
+                elif not isinstance(sale, dict):
+                    sale = {}
+
+                # BatchData's `listing` block carries price/beds/baths/sqft/etc. even
+                # for off-market vacancies (it's the last-known listing snapshot).
+                listing = p.get("listing") or {}
+                # Best available price: current price → last max-list → mortgage loan amount
+                price = (listing.get("price")
+                         or listing.get("maxListPrice")
+                         or sale.get("lastSalePrice")
+                         or ((p.get("mortgageHistory") or [{}])[0].get("loanAmount") if p.get("mortgageHistory") else None))
+                last_sold = listing.get("soldDate") or sale.get("lastSaleDate")
+                property_type_raw = listing.get("propertyType")  # 'SINGLE_FAMILY' etc.
+
+                lead_id = "bd_" + hashlib.sha1(f"{anorm}|{lead_type}".encode()).hexdigest()[:16]
+
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO motivated_sellers
+                      (lead_id, property_address, property_address_norm, city, state, zip_code,
+                       market, property_type, lead_type, distress_signals,
+                       total_open_loans, est_remaining_balance, est_value,
+                       last_sale_date, last_sale_amount,
+                       owner_name_raw, owner_name_norm, owner_mailing_addr, owner_occupied,
+                       source, source_record_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'batchdata', ?)
+                    """,
+                    (lead_id, full_addr, anorm,
+                     addr.get("city"), addr.get("state"), addr.get("zip"),
+                     market, property_type_raw,
+                     lead_type, distress,
+                     int(open_lien.get("totalOpenLienCount") or 0) or None,
+                     int(open_lien.get("totalOpenLienBalance") or 0) or None,
+                     int(price) if price else None,
+                     (last_sold or "")[:10] or None,
+                     int(sale.get("lastSalePrice")) if sale.get("lastSalePrice") else None,
+                     owner_name, normalize_buyer_name(owner_name),
+                     mailing, 1 if ql.get("ownerOccupied") else (0 if "ownerOccupied" in ql else None),
+                     p.get("_id")),
+                )
+                inserted += 1
+        conn.commit()
+
+    _emit(agent, True,
+          {"inserted": inserted, "skipped": skipped, "files": len(files), "market": market, "lead_type": lead_type},
+          meta={"source": "batchdata"})
+
+
+@main.command("enrich-photos")
+@click.option("--source-table", type=click.Choice(["motivated_sellers", "cash_sales"]),
+              default="motivated_sellers")
+@click.option("--market", default=None, help="filter to a single market")
+@click.option("--limit", type=int, default=250, help="max addresses to enrich this run")
+@click.option("--min-photos", type=int, default=5, help="reject results with fewer than this many photo URLs")
+@click.option("--photo-source", type=click.Choice(["google", "zillow"]), default="google",
+              help='"google" uses Streetview + Static-map (no scraping; works regardless of Zillow availability). '
+                   '"zillow" uses BrightData Web Unlocker on Zillow PDPs.')
+@click.option("--agent", is_flag=True)
+def cmd_enrich_photos(source_table: str, market: str | None, limit: int, min_photos: int,
+                       photo_source: str, agent: bool) -> None:
+    """Generate 5+ property photo URLs per address.
+
+    GOOGLE path (default, reliable, no scraping):
+      4 Streetview headings (0°/90°/180°/270°) + 1 satellite Static-map view.
+      Reads GOOGLE_MAPS_API_KEY from ~/.openclaw/.google_maps_api_key.
+      Each URL is signed and stable; the key is embedded — treat the resulting
+      image_urls as containing a billable API key.
+
+    ZILLOW path (requires BrightData Web Unlocker):
+      Scrapes the Zillow PDP per address. Returns the listing's real photos.
+      Falls back gracefully when Zillow blocks; today (2026-05-18) BrightData
+      Web Unlocker zone is mis-configured for this account so this path
+      returns empty.
+    """
+    import urllib.parse
+
+    if photo_source == "google":
+        gmaps_key_file = Path.home() / ".openclaw" / ".google_maps_api_key"
+        gmaps_key = (gmaps_key_file.read_text().strip()
+                     if gmaps_key_file.exists() else os.environ.get("GOOGLE_MAPS_API_KEY"))
+        if not gmaps_key:
+            _emit(agent, False, None, errors=["GOOGLE_MAPS_API_KEY not found"]); return
+        token = None  # not needed for google path
+    else:
+        token = os.environ.get("BRIGHTDATA_TOKEN")
+        if not token:
+            env_file = Path.home() / ".openclaw" / ".env"
+            if env_file.exists():
+                for line in env_file.read_text().splitlines():
+                    if line.startswith("BRIGHTDATA_TOKEN="):
+                        token = line.split("=", 1)[1].strip()
+                        break
+        if not token:
+            _emit(agent, False, None, errors=["BRIGHTDATA_TOKEN not set"]); return
+        try:
+            from property_enrichment import fetch_photos_cheap
+        except ImportError:
+            _emit(agent, False, None,
+                  errors=["property_enrichment not installed: pip install -e ~/Property-Scraper-Tranchi"]); return
+
+    where = "1=1"
+    params: list = []
+    if market:
+        where += " AND market = ?"
+        params.append(market)
+
+    with open_buyers(read_only=True) as conn:
+        if source_table == "motivated_sellers":
+            sql = f"""
+                SELECT m.property_address_norm AS address_norm, m.property_address AS full_addr,
+                       m.city, m.state, m.zip_code
+                  FROM motivated_sellers m
+             LEFT JOIN property_photos pp ON pp.address_norm = m.property_address_norm
+                 WHERE pp.address_norm IS NULL AND {where}
+                 LIMIT ?
+            """
+        else:
+            sql = f"""
+                SELECT cs.property_address_norm AS address_norm, cs.property_address AS full_addr,
+                       cs.city, cs.state, cs.zip_code
+                  FROM cash_sales cs
+             LEFT JOIN property_photos pp ON pp.address_norm = cs.property_address_norm
+                 WHERE pp.address_norm IS NULL AND {where}
+                 LIMIT ?
+            """
+        params.append(limit)
+        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    if not rows:
+        _emit(agent, True, {"enriched": 0, "skipped": "no candidates"}); return
+
+    enriched = 0
+    insufficient = 0
+    failed = 0
+    errors: list[str] = []
+
+    for row in rows:
+        addr_full = ", ".join(filter(None, [
+            row["full_addr"].split(",")[0].strip(),
+            row.get("city") or "", row.get("state") or "", str(row.get("zip_code") or "")
+        ]))
+
+        if photo_source == "google":
+            loc = urllib.parse.quote_plus(addr_full)
+            photos = [
+                f"https://maps.googleapis.com/maps/api/streetview?size=800x600&location={loc}&heading={h}&fov=80&pitch=0&key={gmaps_key}"
+                for h in (0, 90, 180, 270)
+            ]
+            # 5th photo: satellite static map (overhead view)
+            photos.append(
+                f"https://maps.googleapis.com/maps/api/staticmap?center={loc}&zoom=19&size=800x600&maptype=satellite&key={gmaps_key}"
+            )
+            source_label = "google"
+            source_url = f"https://maps.google.com/?q={loc}"
+        else:
+            slug = urllib.parse.quote(addr_full)
+            zurl = f"https://www.zillow.com/homes/{slug}_rb/"
+            result = fetch_photos_cheap(token, zurl)
+            if not result.get("ok"):
+                failed += 1
+                if result.get("error"):
+                    errors.append(result["error"][:120])
+                continue
+            photos = result.get("photo_urls") or []
+            source_label = "zillow"
+            source_url = zurl
+
+        if len(photos) < min_photos:
+            insufficient += 1
+            continue
+
+        with open_buyers() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO property_photos
+                  (address_norm, image_urls, photo_count, source, source_url)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (row["address_norm"], json.dumps(photos), len(photos), source_label, source_url),
+            )
+            conn.commit()
+        enriched += 1
+
+    _emit(agent, True,
+          {"enriched": enriched, "insufficient_photos": insufficient, "fetch_failed": failed,
+           "min_photos": min_photos, "candidates": len(rows)},
+          errors=errors, meta={"source_table": source_table, "market": market})
+
+
+@main.command("push-tranchi-leads")
+@click.option("--source-table", type=click.Choice(["motivated_sellers", "cash_sales"]),
+              default="motivated_sellers")
+@click.option("--market", default=None)
+@click.option("--limit", type=int, default=250)
+@click.option("--min-photos", type=int, default=5)
+@click.option("--dry-run", is_flag=True)
+@click.option("--agent", is_flag=True)
+def cmd_push_tranchi_leads(source_table: str, market: str | None, limit: int,
+                            min_photos: int, dry_run: bool, agent: bool) -> None:
+    """Build the tranchi-pp-cli leads payload from motivated_sellers (or cash_sales)
+    joined with property_photos, then POST via `tranchi-pp-cli leads upload`.
+
+    Skips rows without ≥min-photos photos (Tranchi silently drops short image
+    arrays). Writes the response to tranchi_push_log.
+    """
+    # Photos optional when min_photos == 0 (LEFT JOIN); required (INNER) otherwise.
+    photo_join = "LEFT JOIN" if min_photos == 0 else "JOIN"
+    where = "1=1" if min_photos == 0 else "COALESCE(p.photo_count, 0) >= ?"
+    params: list = [] if min_photos == 0 else [min_photos]
+    if market:
+        where += " AND m.market = ?"
+        params.append(market)
+
+    with open_buyers() as conn:
+        if source_table == "motivated_sellers":
+            sql = f"""
+                SELECT m.lead_id AS row_id, m.property_address AS address, m.city, m.state,
+                       m.zip_code AS zip, m.lead_type AS deal_type,
+                       m.owner_name_raw, m.owner_mailing_addr,
+                       m.est_value, m.last_sale_amount,
+                       p.image_urls, COALESCE(p.photo_count, 0) AS photo_count,
+                       m.property_address_norm AS address_norm
+                  FROM motivated_sellers m
+            {photo_join} property_photos p ON p.address_norm = m.property_address_norm
+             LEFT JOIN tranchi_push_log tpl ON tpl.address_norm = m.property_address_norm
+                 WHERE {where} AND tpl.address_norm IS NULL
+                 LIMIT ?
+            """
+        else:
+            sql = f"""
+                SELECT cs.sale_id AS row_id, cs.property_address AS address, cs.city, cs.state,
+                       cs.zip_code AS zip, 'cash_buyer' AS deal_type,
+                       cs.buyer_name_raw AS owner_name_raw, cs.buyer_mailing_addr AS owner_mailing_addr,
+                       NULL AS est_value, cs.sale_price AS last_sale_amount,
+                       p.image_urls, COALESCE(p.photo_count, 0) AS photo_count,
+                       cs.property_address_norm AS address_norm
+                  FROM cash_sales cs
+            {photo_join} property_photos p ON p.address_norm = cs.property_address_norm
+             LEFT JOIN tranchi_push_log tpl ON tpl.address_norm = cs.property_address_norm
+                 WHERE {where} AND tpl.address_norm IS NULL
+                 LIMIT ?
+            """
+        params.append(limit)
+        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    if not rows:
+        _emit(agent, True, {"pushed": 0, "skipped": "no candidates with ≥5 photos"}); return
+
+    # Build tranchi leads payload — one lead per row.
+    # Tranchi.ai requires `price` (rejects with "price field is null or empty").
+    leads = []
+    skipped_no_price = 0
+    for r in rows:
+        price = r.get("est_value") or r.get("last_sale_amount")
+        if not price:
+            skipped_no_price += 1
+            continue
+        image_urls = json.loads(r["image_urls"]) if r["image_urls"] else []
+        leads.append({
+            "address":        r["address"],
+            "city":           r["city"],
+            "state":          r["state"],
+            "zip_code":       str(r["zip"] or ""),
+            "price":          int(price),
+            "deal_type":      r["deal_type"],
+            "owner_name":     r["owner_name_raw"],
+            "owner_mailing":  r["owner_mailing_addr"],
+            "estimated_value":r["est_value"],
+            "last_sale_amount": r["last_sale_amount"],
+            "image_urls":     image_urls,
+            "source":         "cash-buyer-scraper",
+            "external_id":    r["row_id"],
+        })
+
+    if dry_run:
+        _emit(agent, True, {"would_push": len(leads), "sample": leads[:2]},
+              meta={"dry_run": True})
+        return
+
+    # POST via tranchi-pp-cli leads upload --stdin
+    body = json.dumps({"leads": leads})
+    try:
+        proc = subprocess.run(
+            [_pp_bin("tranchi-pp-cli"), "leads", "upload", "--stdin", "--agent"],
+            input=body, capture_output=True, text=True, timeout=120, check=False,
+        )
+    except FileNotFoundError:
+        _emit(agent, False, None, errors=["tranchi-pp-cli not found"]); return
+
+    # Log every push, success or fail
+    response_status = "ok" if proc.returncode == 0 else "error"
+    response_body = (proc.stdout or "") + (proc.stderr or "")
+    with open_buyers() as conn:
+        for r in rows:
+            conn.execute(
+                """
+                INSERT INTO tranchi_push_log
+                  (address_norm, source_table, source_row_id, payload, response_status, response_body, image_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (r["address_norm"], source_table, r["row_id"], json.dumps({"address": r["address"]}),
+                 response_status, response_body[:2000], r["photo_count"]),
+            )
+        conn.commit()
+
+    _emit(agent, response_status == "ok",
+          {"pushed": len(leads), "exit_code": proc.returncode, "response_head": response_body[:500]},
+          errors=[] if response_status == "ok" else [response_body[:500]],
+          meta={"source_table": source_table, "market": market})
+
+
 @main.command("sync-county")
 @click.option("--market", required=True)
 @click.option("--portal", required=True, help="county portal slug from county-portal-scraper")

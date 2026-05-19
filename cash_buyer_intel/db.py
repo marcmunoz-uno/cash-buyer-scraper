@@ -296,6 +296,31 @@ CREATE INDEX IF NOT EXISTS motivated_sellers_market    ON motivated_sellers(mark
 CREATE INDEX IF NOT EXISTS motivated_sellers_lead_type ON motivated_sellers(lead_type);
 CREATE INDEX IF NOT EXISTS motivated_sellers_owner     ON motivated_sellers(owner_name_norm);
 
+-- Photo enrichment results, keyed by address. Populated by `enrich-photos`.
+CREATE TABLE IF NOT EXISTS property_photos (
+    address_norm    TEXT PRIMARY KEY,
+    image_urls      TEXT NOT NULL,            -- JSON array of URLs
+    photo_count     INTEGER NOT NULL,
+    source          TEXT NOT NULL,            -- 'zillow' | 'streetview' | etc.
+    source_url      TEXT,                     -- where they were sourced from
+    fetched_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS property_photos_source ON property_photos(source);
+
+-- Tranchi.ai push log — what we've shipped, when, and the response status.
+CREATE TABLE IF NOT EXISTS tranchi_push_log (
+    push_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    address_norm     TEXT NOT NULL,
+    source_table     TEXT NOT NULL,            -- 'motivated_sellers' | 'cash_sales'
+    source_row_id    TEXT,
+    payload          TEXT NOT NULL,            -- JSON we sent
+    response_status  TEXT,
+    response_body    TEXT,
+    image_count      INTEGER,
+    pushed_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS tranchi_push_log_addr ON tranchi_push_log(address_norm);
+
 -- Owned-cache for BatchData (lookup-only PP CLI; no source SQLite of its own).
 CREATE TABLE IF NOT EXISTS batchdata_cache (
     address_norm     TEXT PRIMARY KEY,

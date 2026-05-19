@@ -425,6 +425,13 @@ cash-buyer-intel ingest-propstream \
 - ⚠️ Date-based velocity needs BatchData `deed` dataset or live ATTOM
 - 📋 `push-tranchi` stubbed — production-side `cash_buyers` endpoint pending
 
+**v0.3 — End-to-end photo + tranchi push (validated 2026-05-18 on 250 Wichita leads).**
+- ✅ `ingest-batchdata-sellers` parses paged BatchData JSON into motivated_sellers (price, beds, baths, sqft, year-built all extracted from `listing` block)
+- ✅ `enrich-photos --photo-source google` generates 5 image_urls/property (4 Streetview angles + 1 satellite static-map). $0 marginal cost — uses the shared Google Maps key.
+- ✅ `enrich-photos --photo-source zillow` available as fallback (BrightData Web Unlocker → Zillow PDP). Currently blocked by BrightData zone issue.
+- ✅ `push-tranchi-leads` POSTs to `tranchi.ai/api/leads` via `tranchi-pp-cli`. Adds required `price` field, skips rows without prices. Logs every push to `tranchi_push_log` (response status, body, image count).
+- Live demo: 250 Wichita vacant+high-equity → 250 enriched with photos → 128 pushed (122 lacked prices) → Tranchi accepted 0 net imports (4 rejected on `price < $2000`, 124 already in DB). Pipeline mechanically correct; Wichita just has heavy existing coverage.
+
 **v0.2 — PropStream paths, motivated-seller lists.**
 - ✅ Cash-buyer export from PropStream UI (`ingest-propstream`, 100% sale-date coverage)
 - ✅ Pre-Foreclosure / NOD export ([SOP](docs/propstream/export-preforeclosure.md); 15 leads validated in 63116)
