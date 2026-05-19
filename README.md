@@ -425,6 +425,12 @@ cash-buyer-intel ingest-propstream \
 - ⚠️ Date-based velocity needs BatchData `deed` dataset or live ATTOM
 - 📋 `push-tranchi` stubbed — production-side `cash_buyers` endpoint pending
 
+**v0.7 — Zestimate price backfill + tranchi coverage 521/955 (validated 2026-05-19).**
+- ✅ `enrich-zestimate` — scrapes Zillow PDPs via BrightData (~$0.001/address; 50× cheaper than BatchData property lookup at ~$0.05) and regex-extracts the Zestimate into `motivated_sellers.est_value`
+- ✅ Live run on 572 priceless Wichita records: **158 new prices**, 307 had no Zestimate, 66 below $2K minimum, 41 fetch fail. Cost ≈ $0.57.
+- ✅ Re-pushed to tranchi with the new prices + improved photos: **521 of 955 properties now have our photos on tranchi.ai** (up from 369 before Zestimate enrichment).
+- 📋 The remaining 434 are genuinely not in tranchi's DB (verified via /api/leads/enrich → `not_found`). Push attempts get rejected by POST /api/leads as duplicate anyway — likely archived leads that the enrich endpoint doesn't surface.
+
 **v0.6 — Real Zillow photos via BrightData + 8-worker concurrency (validated 2026-05-19).**
 - ✅ BrightData reactivated → Zillow stage of the waterfall produces real listing photos again
 - ✅ `motivated_sellers.listing_url` stored from BatchData's `listing.listingUrl` → enables the Zillow stage of `fetch_photos_waterfall`

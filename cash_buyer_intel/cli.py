@@ -870,6 +870,153 @@ def cmd_push_tranchi_leads(source_table: str, market: str | None, limit: int,
           meta={"source_table": source_table, "market": market})
 
 
+@main.command("enrich-zestimate")
+@click.option("--source-table", type=click.Choice(["motivated_sellers", "cash_sales"]),
+              default="motivated_sellers")
+@click.option("--market", default=None)
+@click.option("--limit", type=int, default=1000)
+@click.option("--workers", type=int, default=8,
+              help="concurrent BrightData scrapes (8 is safe on Web Unlocker)")
+@click.option("--min-price", type=int, default=2000,
+              help="ignore Zestimates below this (matches tranchi's minimum)")
+@click.option("--agent", is_flag=True)
+def cmd_enrich_zestimate(source_table: str, market: str | None, limit: int,
+                          workers: int, min_price: int, agent: bool) -> None:
+    """Backfill est_value via Zillow Zestimate scrape (~$0.001 per address).
+
+    For rows with no price, scrape the Zillow PDP via BrightData Web Unlocker
+    and regex out the Zestimate. Falls back to address-redirect URL
+    (https://www.zillow.com/homes/<addr>_rb/) when listing_url isn't set.
+
+    Cheaper than BatchData property lookup ($0.05/credit) by ~50x; trades
+    coverage (not every address has a Zillow Zestimate) for cost.
+    """
+    import re as _re
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+    import urllib.parse
+
+    token = os.environ.get("BRIGHTDATA_TOKEN")
+    if not token:
+        env = Path.home() / ".openclaw" / ".env"
+        if env.exists():
+            for line in env.read_text().splitlines():
+                if line.startswith("BRIGHTDATA_TOKEN="):
+                    token = line.split("=", 1)[1].strip()
+                    break
+    if not token:
+        _emit(agent, False, None, errors=["BRIGHTDATA_TOKEN not set"]); return
+
+    try:
+        from property_enrichment.brightdata import BrightDataMCPClient
+    except ImportError:
+        _emit(agent, False, None, errors=["property_enrichment not installed"]); return
+
+    # Zillow surfaces Zestimate in plain text "Zestimate ... is $124,000"
+    # Be tolerant: any "Zestimate ... is $N" pattern in the page.
+    ZEST_RE = _re.compile(r"Zestimate[^$<\"]{0,80}is\s*\$([\d,]+)", _re.IGNORECASE)
+    # Backup: structured JSON in the page often has "price": 124000
+    JSON_PRICE_RE = _re.compile(r'"zestimate"\s*:\s*(\d+)')
+
+    where = "1=1"
+    params: list = []
+    if market:
+        where += f" AND m.market = ?"
+        params.append(market)
+    table_join = (
+        "motivated_sellers m" if source_table == "motivated_sellers"
+        else "cash_sales m")
+    # cash_sales uses sale_price; we backfill est_value-equivalent into NULL price column
+    target_col = "est_value" if source_table == "motivated_sellers" else "sale_price"
+
+    with open_buyers(read_only=True) as conn:
+        sql = f"""
+            SELECT m.property_address_norm AS address_norm,
+                   m.property_address AS address,
+                   m.city, m.state, m.zip_code, m.{('listing_url' if source_table=='motivated_sellers' else 'NULL listing_url')}
+              FROM {table_join}
+             WHERE m.{target_col} IS NULL
+               AND {where}
+             LIMIT ?
+        """
+        params.append(limit)
+        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    if not rows:
+        _emit(agent, True, {"updated": 0, "skipped": "no candidates with NULL price"}); return
+
+    db_lock = threading.Lock()
+    updated = 0
+    no_zestimate = 0
+    too_low = 0
+    fetch_failed = 0
+    errors: list[str] = []
+
+    # Thread-local BrightData client (each worker gets its own session)
+    tls = threading.local()
+    def client():
+        if not hasattr(tls, "c"):
+            tls.c = BrightDataMCPClient(token)
+        return tls.c
+
+    def process(row):
+        # Pick best URL — saved listing_url if any, else address-redirect
+        url = row.get("listing_url")
+        if not url:
+            slug = urllib.parse.quote(", ".join(filter(None, [
+                row["address"].split(",")[0].strip(),
+                row.get("city") or "", row.get("state") or "",
+                str(row.get("zip_code") or "")
+            ])))
+            url = f"https://www.zillow.com/homes/{slug}_rb/"
+        try:
+            html = client().call_tool("scrape_as_html", {"url": url}, timeout=60)
+        except Exception as e:
+            return row, None, f"scrape failed: {e}"[:120]
+        if not html or not isinstance(html, str):
+            return row, None, "empty html"
+        m = ZEST_RE.search(html) or JSON_PRICE_RE.search(html)
+        if not m:
+            return row, None, "no Zestimate in page"
+        try:
+            value = int(m.group(1).replace(",", ""))
+        except ValueError:
+            return row, None, f"unparseable: {m.group(1)}"
+        return row, value, None
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        futures = [ex.submit(process, r) for r in rows]
+        for fut in as_completed(futures):
+            row, value, err = fut.result()
+            if err == "no Zestimate in page":
+                no_zestimate += 1
+                continue
+            if err:
+                fetch_failed += 1
+                if len(errors) < 5:
+                    errors.append(err)
+                continue
+            if value < min_price:
+                too_low += 1
+                continue
+            with db_lock:
+                with open_buyers() as conn:
+                    if source_table == "motivated_sellers":
+                        conn.execute("UPDATE motivated_sellers SET est_value = ? WHERE property_address_norm = ?",
+                                     (value, row["address_norm"]))
+                    else:
+                        conn.execute("UPDATE cash_sales SET sale_price = ? WHERE property_address_norm = ?",
+                                     (value, row["address_norm"]))
+                    conn.commit()
+            updated += 1
+
+    _emit(agent, True,
+          {"updated": updated, "no_zestimate": no_zestimate,
+           "below_min_price": too_low, "fetch_failed": fetch_failed,
+           "candidates": len(rows)},
+          errors=errors[:5], meta={"source_table": source_table, "market": market, "min_price": min_price})
+
+
 @main.command("tranchi-backfill-photos")
 @click.option("--source-table", type=click.Choice(["motivated_sellers", "cash_sales"]),
               default="motivated_sellers")
