@@ -380,7 +380,10 @@ def cmd_ingest_propstream(xlsx_path: str, market: str | None, agent: bool) -> No
 @click.option("--lead-type", required=True,
               type=click.Choice(["pre-foreclosure", "vacant", "absentee", "high-equity",
                                  "tired-landlord", "probate", "tax-default",
-                                 "vacant-equity-absentee", "other"]),
+                                 "vacant-equity-absentee",
+                                 "failed-listing", "canceled-listing", "expired-listing",
+                                 "recently-sold", "active-listing", "pending-listing",
+                                 "other"]),
               help="which PropStream lead-list this export came from")
 @click.option("--market", default=None, help="market label (defaults to filename stem)")
 @click.option("--agent", is_flag=True)
@@ -493,7 +496,10 @@ def cmd_ingest_propstream_list(xlsx_path: str, lead_type: str, market: str | Non
 @click.option("--lead-type", required=True,
               type=click.Choice(["pre-foreclosure", "vacant", "absentee", "high-equity",
                                  "tired-landlord", "probate", "tax-default",
-                                 "vacant-equity-absentee", "other"]))
+                                 "vacant-equity-absentee",
+                                 "failed-listing", "canceled-listing", "expired-listing",
+                                 "recently-sold", "active-listing", "pending-listing",
+                                 "other"]))
 @click.option("--market", required=True)
 @click.option("--agent", is_flag=True)
 def cmd_ingest_batchdata_sellers(json_glob: str, lead_type: str, market: str, agent: bool) -> None:
