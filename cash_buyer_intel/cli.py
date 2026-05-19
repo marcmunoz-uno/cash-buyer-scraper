@@ -275,6 +275,106 @@ def _store_batchdata_results(rows: list[dict], market: str) -> tuple[int, int]:
     return cached, projected
 
 
+@main.command("ingest-propstream")
+@click.argument("xlsx_path", type=click.Path(exists=True))
+@click.option("--market", default=None, help="market label (default: inferred from filename)")
+@click.option("--agent", is_flag=True)
+def cmd_ingest_propstream(xlsx_path: str, market: str | None, agent: bool) -> None:
+    """Ingest a PropStream cash-buyer export (XLSX) into cash_sales.
+
+    PropStream's saved-list Export produces `Property Export <name>.xlsx` with
+    75 columns. We use: Address/City/State/Zip/County/APN, Owner 1/2 names,
+    Mailing Address (joined), Last Sale Recording Date, Last Sale Amount,
+    Property Type, Total Open Loans (must be 0 for a true cash buyer).
+
+    100% sale-date coverage, ~79% sale-amount coverage on the validated 63116
+    sample. Costs $0 above the user's existing PropStream subscription.
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        _emit(agent, False, None,
+              errors=["pandas not installed — `pip install pandas openpyxl` in the venv"])
+        return
+
+    df = pd.read_excel(xlsx_path)
+    market = market or Path(xlsx_path).stem.replace("Property Export ", "").strip() or "propstream"
+
+    def col(row, name, default=None):
+        v = row.get(name, default)
+        return None if (v is None or (isinstance(v, float) and v != v)) else v
+
+    inserted = 0
+    skipped_with_loans = 0
+    with open_buyers() as conn:
+        for _, r in df.iterrows():
+            street = col(r, "Address")
+            if not street:
+                continue
+            # Defensive cash-buyer check: PropStream's Cash Buyers filter
+            # already applied during export, but verify Total Open Loans = 0
+            # so we never ingest a financed property as a cash sale.
+            open_loans = col(r, "Total Open Loans")
+            if open_loans is not None and float(open_loans) > 0:
+                skipped_with_loans += 1
+                continue
+
+            full_addr = ", ".join(filter(None, [
+                str(street),
+                str(col(r, "City") or ""),
+                str(col(r, "State") or ""),
+                str(col(r, "Zip") or ""),
+            ]))
+            anorm = normalize_address(full_addr)
+
+            owner_parts = [col(r, "Owner 1 First Name"), col(r, "Owner 1 Last Name")]
+            owner_name = " ".join(p for p in owner_parts if p) or col(r, "Owner 1 Last Name") or "(unknown)"
+            # Joint-ownership case
+            o2 = " ".join(p for p in (col(r, "Owner 2 First Name"), col(r, "Owner 2 Last Name")) if p)
+            if o2:
+                owner_name = f"{owner_name} & {o2}"
+
+            mailing = ", ".join(filter(None, [
+                str(col(r, "Mailing Address") or ""),
+                str(col(r, "Mailing City") or ""),
+                str(col(r, "Mailing State") or ""),
+                str(col(r, "Mailing Zip") or ""),
+            ])) or None
+
+            sale_date = col(r, "Last Sale Recording Date")
+            if sale_date is not None:
+                sale_date = str(sale_date)[:10]
+            sale_price = col(r, "Last Sale Amount")
+            if sale_price is not None:
+                sale_price = int(float(sale_price))
+
+            sale_id = f"propstream:{anorm}:{sale_date or 'unknown'}"
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO cash_sales
+                  (sale_id, property_address, property_address_norm, city, state, zip_code,
+                   market, property_type, sale_date, sale_price, mortgage_amount,
+                   buyer_name_raw, buyer_name_norm, buyer_mailing_addr, seller_name,
+                   source, source_record_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, 'propstream', ?)
+                """,
+                (sale_id, full_addr, anorm,
+                 col(r, "City"), col(r, "State"), str(col(r, "Zip") or ""),
+                 market, col(r, "Property Type"),
+                 sale_date or "unknown", sale_price,
+                 owner_name, normalize_buyer_name(owner_name),
+                 mailing, col(r, "APN")),
+            )
+            inserted += 1
+        conn.commit()
+
+    _emit(agent, True,
+          {"inserted": inserted, "skipped_with_loans": skipped_with_loans,
+           "rows_in_xlsx": len(df), "market": market},
+          meta={"source": "propstream", "xlsx": xlsx_path})
+
+
 @main.command("sync-county")
 @click.option("--market", required=True)
 @click.option("--portal", required=True, help="county portal slug from county-portal-scraper")
