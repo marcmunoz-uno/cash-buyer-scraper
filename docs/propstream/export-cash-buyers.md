@@ -54,11 +54,14 @@ Verified live 2026-05-18: ZIP 63116 → 2,559 cash-buyer rows × 75 columns. **L
        is desired — that charges credits.
      - Click "Save" button (≈ 699, 513). Wait for the loading spinner to clear
        (1–10s depending on selection size).
-10. Navigate to the lists page:
-      goto_url("https://app.propstream.com/property/group/0")
+10. **Capture the new list's ID from the Save POST response** via CDP Network
+    (see [cdp-list-id-capture.md](cdp-list-id-capture.md)). This is the
+    reliable replacement for the old sidebar-clicking step, which fails when
+    the account has more than ~9 saved lists (virtual-scroll renders the
+    newly-saved list below the fold and `scrollIntoView` doesn't work).
+11. Navigate directly to the list:
+      goto_url(f"https://app.propstream.com/property/group/{list_id}")
     Close the "PropStream Updates" welcome modal if present.
-11. In the left sidebar under "Marketing Lists", click the newly-saved list
-    by name. The center pane loads the list rows.
 12. Click the master select-all checkbox on the table header (≈ 422, 191).
     The toolbar "Export" button transitions from disabled (opacity 0.5) to
     enabled (opacity 1).
