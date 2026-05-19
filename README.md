@@ -425,6 +425,15 @@ cash-buyer-intel ingest-propstream \
 - ⚠️ Date-based velocity needs BatchData `deed` dataset or live ATTOM
 - 📋 `push-tranchi` stubbed — production-side `cash_buyers` endpoint pending
 
+**v0.2 — PropStream paths, motivated-seller lists.**
+- ✅ Cash-buyer export from PropStream UI (`ingest-propstream`, 100% sale-date coverage)
+- ✅ Pre-Foreclosure / NOD export ([SOP](docs/propstream/export-preforeclosure.md); 15 leads validated in 63116)
+- ✅ Vacant + High-Equity + Absentee multi-filter export ([SOP](docs/propstream/export-vacant-equity-absentee.md); 1,437 vacant properties validated)
+- ✅ New `motivated_sellers` table — seller-side leads kept semantically distinct from `cash_sales`
+- ✅ Generic `ingest-propstream-list --lead-type <type>` ingests any PropStream XLSX export
+- 📋 Multi-filter exact-state-management polish (Clear-All-first sequence; Absentee Owner Location scroll)
+- 📋 Cross-reference motivated_sellers ↔ cash_sales by ZIP/owner mailing for "who is selling to whom" insights
+
 **v0.2 — Tier B.**
 - Wire `sync-county` to `county-portal-scraper` output for the 32 markets already cracked.
 - Cross-tier dedup: same buyer found in ATTOM AND county portal collapses cleanly.

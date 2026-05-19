@@ -260,6 +260,42 @@ CREATE TABLE IF NOT EXISTS buyer_outreach (
 );
 CREATE INDEX IF NOT EXISTS buyer_outreach_entity ON buyer_outreach(entity_id);
 
+-- Motivated-seller leads from PropStream (Pre-Foreclosure, Vacant+Equity+Absentee, etc.).
+-- Seller-side leads, semantically distinct from cash_sales (which are buyer-side).
+-- One row per property × lead-list-type observation. Same property can appear in
+-- multiple lists (e.g. Vacant AND Pre-Foreclosure) — primary key includes lead_type.
+-- Stub added in v0.2; ingestion via `ingest-propstream-list`.
+CREATE TABLE IF NOT EXISTS motivated_sellers (
+    lead_id              TEXT PRIMARY KEY,            -- hash of (address_norm, lead_type, list_export_date)
+    property_address     TEXT NOT NULL,
+    property_address_norm TEXT NOT NULL,
+    city                 TEXT,
+    state                TEXT,
+    zip_code             TEXT,
+    market               TEXT,
+    property_type        TEXT,
+    lead_type            TEXT NOT NULL,               -- 'pre-foreclosure' | 'vacant' | 'absentee' | 'high-equity' | 'tired-landlord' | etc.
+    distress_signals     TEXT,                        -- comma-separated quickList flags from PropStream
+    foreclosure_factor   REAL,
+    total_open_loans     INTEGER,
+    est_remaining_balance INTEGER,
+    est_value            INTEGER,
+    est_equity           INTEGER,
+    est_ltv              REAL,
+    last_sale_date       TEXT,
+    last_sale_amount     INTEGER,
+    owner_name_raw       TEXT NOT NULL,
+    owner_name_norm      TEXT NOT NULL,
+    owner_mailing_addr   TEXT,
+    owner_occupied       INTEGER,                     -- 0/1
+    source               TEXT NOT NULL,               -- 'propstream' for now; future: 'county-portal-direct'
+    source_record_id     TEXT,                        -- PropStream APN or other stable id
+    loaded_at            TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS motivated_sellers_market    ON motivated_sellers(market);
+CREATE INDEX IF NOT EXISTS motivated_sellers_lead_type ON motivated_sellers(lead_type);
+CREATE INDEX IF NOT EXISTS motivated_sellers_owner     ON motivated_sellers(owner_name_norm);
+
 -- Owned-cache for BatchData (lookup-only PP CLI; no source SQLite of its own).
 CREATE TABLE IF NOT EXISTS batchdata_cache (
     address_norm     TEXT PRIMARY KEY,

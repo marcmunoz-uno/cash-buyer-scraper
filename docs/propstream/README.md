@@ -7,6 +7,8 @@ Standard Operating Procedures for driving PropStream's web UI via [browser-harne
 | SOP | Lead-list type | Status |
 |---|---|---|
 | [export-cash-buyers.md](export-cash-buyers.md) | Cash Buyer | ✅ validated 2026-05-18 (2,559 rows / ZIP 63116, $0) |
+| [export-preforeclosure.md](export-preforeclosure.md) | Pre-Foreclosure / NOD | ✅ validated 2026-05-18 (15 rows / ZIP 63116, $0) |
+| [export-vacant-equity-absentee.md](export-vacant-equity-absentee.md) | Vacant + High-Equity + Absentee (multi-filter) | ⚠️ partial 2026-05-18 — Vacant tile validated (1,437 rows); High-Equity tile state-sticky; Absentee Owner Location requires extra scrolling. Mechanics work; needs deterministic Clear-All-first sequence. |
 
 ## Authoring conventions
 

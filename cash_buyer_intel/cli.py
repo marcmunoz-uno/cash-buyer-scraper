@@ -375,6 +375,119 @@ def cmd_ingest_propstream(xlsx_path: str, market: str | None, agent: bool) -> No
           meta={"source": "propstream", "xlsx": xlsx_path})
 
 
+@main.command("ingest-propstream-list")
+@click.argument("xlsx_path", type=click.Path(exists=True))
+@click.option("--lead-type", required=True,
+              type=click.Choice(["pre-foreclosure", "vacant", "absentee", "high-equity",
+                                 "tired-landlord", "probate", "tax-default",
+                                 "vacant-equity-absentee", "other"]),
+              help="which PropStream lead-list this export came from")
+@click.option("--market", default=None, help="market label (defaults to filename stem)")
+@click.option("--agent", is_flag=True)
+def cmd_ingest_propstream_list(xlsx_path: str, lead_type: str, market: str | None, agent: bool) -> None:
+    """Ingest a PropStream motivated-seller XLSX export into motivated_sellers.
+
+    Same 75-column shape as the cash-buyers export; semantic difference is
+    the filter that produced it. Each export becomes one or more rows tagged
+    with the lead_type. v0.2 scaffold — wires the SOP outputs into a queryable
+    table without bloating cash_sales (which stays buyer-side only).
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        _emit(agent, False, None,
+              errors=["pandas not installed — `pip install pandas openpyxl` in the venv"])
+        return
+
+    df = pd.read_excel(xlsx_path)
+    market = market or Path(xlsx_path).stem.replace("Property Export ", "").strip() or "propstream"
+
+    def col(row, name, default=None):
+        v = row.get(name, default)
+        return None if (v is None or (isinstance(v, float) and v != v)) else v
+
+    inserted = 0
+    import hashlib
+    from datetime import datetime
+    export_date = datetime.utcnow().strftime("%Y-%m-%d")
+
+    with open_buyers() as conn:
+        for _, r in df.iterrows():
+            street = col(r, "Address")
+            if not street:
+                continue
+            full_addr = ", ".join(filter(None, [
+                str(street), str(col(r, "City") or ""), str(col(r, "State") or ""), str(col(r, "Zip") or ""),
+            ]))
+            anorm = normalize_address(full_addr)
+
+            owner_parts = [col(r, "Owner 1 First Name"), col(r, "Owner 1 Last Name")]
+            owner_name = " ".join(p for p in owner_parts if p) or col(r, "Owner 1 Last Name") or "(unknown)"
+
+            mailing = ", ".join(filter(None, [
+                str(col(r, "Mailing Address") or ""),
+                str(col(r, "Mailing City") or ""),
+                str(col(r, "Mailing State") or ""),
+                str(col(r, "Mailing Zip") or ""),
+            ])) or None
+
+            sale_date = col(r, "Last Sale Recording Date")
+            if sale_date is not None:
+                sale_date = str(sale_date)[:10]
+            sale_amount = col(r, "Last Sale Amount")
+            sale_amount = int(float(sale_amount)) if sale_amount is not None else None
+
+            lead_id = "ps_" + hashlib.sha1(f"{anorm}|{lead_type}|{export_date}".encode()).hexdigest()[:16]
+
+            def to_int(v):
+                if v is None: return None
+                try: return int(float(v))
+                except (ValueError, TypeError): return None
+
+            def to_float(v):
+                if v is None: return None
+                try: return float(v)
+                except (ValueError, TypeError): return None
+
+            owner_occ_raw = col(r, "Owner Occupied")
+            owner_occ = 1 if str(owner_occ_raw).strip().lower() in ("yes", "y", "true", "1") else (
+                       0 if str(owner_occ_raw).strip().lower() in ("no", "n", "false", "0") else None)
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO motivated_sellers
+                  (lead_id, property_address, property_address_norm, city, state, zip_code,
+                   market, property_type, lead_type, distress_signals,
+                   foreclosure_factor, total_open_loans, est_remaining_balance, est_value,
+                   est_equity, est_ltv, last_sale_date, last_sale_amount,
+                   owner_name_raw, owner_name_norm, owner_mailing_addr, owner_occupied,
+                   source, source_record_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'propstream', ?)
+                """,
+                (lead_id, full_addr, anorm,
+                 col(r, "City"), col(r, "State"), str(col(r, "Zip") or ""),
+                 market, col(r, "Property Type"),
+                 lead_type,
+                 None,  # distress_signals — could derive from quickList columns if customized
+                 to_float(col(r, "Foreclosure Factor")),
+                 to_int(col(r, "Total Open Loans")),
+                 to_int(col(r, "Est. Remaining balance of Open Loans")),
+                 to_int(col(r, "Est. Value")),
+                 to_int(col(r, "Est. Equity")),
+                 to_float(col(r, "Est. Loan-to-Value")),
+                 sale_date, sale_amount,
+                 owner_name, normalize_buyer_name(owner_name),
+                 mailing, owner_occ,
+                 col(r, "APN")),
+            )
+            inserted += 1
+        conn.commit()
+
+    _emit(agent, True,
+          {"inserted": inserted, "rows_in_xlsx": len(df), "lead_type": lead_type, "market": market},
+          meta={"source": "propstream", "xlsx": xlsx_path})
+
+
 @main.command("sync-county")
 @click.option("--market", required=True)
 @click.option("--portal", required=True, help="county portal slug from county-portal-scraper")
