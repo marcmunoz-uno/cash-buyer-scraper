@@ -387,6 +387,21 @@ CREATE TABLE batchdata_cache (
 
 ---
 
+## PropStream path (no API, free with subscription)
+
+PropStream has no API but its web UI exports cash-buyer lists as XLSX. We drive the export via `browser-harness` and ingest the result via `cash-buyer-intel ingest-propstream`. **$0 marginal cost** above the existing subscription.
+
+Validated 2026-05-18 on ZIP 63116: 2,559 rows × 75 columns. 100% sale-date coverage, 79% sale-price coverage, 98% open-loan-count (defensive cash-buyer check — 469 of PropStream's "cash buyers" had open loans and were rejected on ingest).
+
+SOP: [docs/propstream/export-cash-buyers.md](docs/propstream/export-cash-buyers.md)
+
+```bash
+# After running the SOP and downloading the XLSX:
+cash-buyer-intel ingest-propstream \
+  "~/Downloads/Property Export cash-buyers-63116-test.xlsx" \
+  --market "St. Louis MO"
+```
+
 ## Companion repos
 
 | Repo | Role |
