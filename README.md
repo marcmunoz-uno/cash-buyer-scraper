@@ -425,6 +425,13 @@ cash-buyer-intel ingest-propstream \
 - ⚠️ Date-based velocity needs BatchData `deed` dataset or live ATTOM
 - 📋 `push-tranchi` stubbed — production-side `cash_buyers` endpoint pending
 
+**v0.10 — Loop iteration: tranchi rate-limit is *per-attempt*, not per-clock.**
+- Snapshot at this iteration:
+  - `property_photos` total: 4,399 (1,334 Zillow / 3,065 Street View+Esri)
+  - `tranchi_push_log` distinct addresses logged: 2,483
+- Re-running `tranchi-backfill-photos` immediately hit `HTTP 429 retryAfter=2302s` (~38 min) on chunk 0 — confirms tranchi's rate-limit resets on each new batch attempt, not on a wall-clock interval. Every retry pushes the window further out.
+- **Action**: scheduled the next loop fire for *after* the window naturally clears (~42 min from this run). Aggressive retries make the wait longer, not shorter.
+
 **v0.9 — Full 3,600 pipeline run; tranchi /api/leads/enrich hits per-window rate-limit.**
 - ✅ Enrichment finished: 3,457/3,600 photo-enriched, **1,334 Zillow-primary** + 2,123 Street View / Esri fallback
 - ✅ Total photo URLs collected: 43,001 Zillow + 9,469 Street View + 4,709 Esri = **57,179** (~16 per property on Zillow primaries)
