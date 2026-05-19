@@ -425,6 +425,13 @@ cash-buyer-intel ingest-propstream \
 - ⚠️ Date-based velocity needs BatchData `deed` dataset or live ATTOM
 - 📋 `push-tranchi` stubbed — production-side `cash_buyers` endpoint pending
 
+**v0.6 — Real Zillow photos via BrightData + 8-worker concurrency (validated 2026-05-19).**
+- ✅ BrightData reactivated → Zillow stage of the waterfall produces real listing photos again
+- ✅ `motivated_sellers.listing_url` stored from BatchData's `listing.listingUrl` → enables the Zillow stage of `fetch_photos_waterfall`
+- ✅ `enrich-photos --workers N` runs the waterfall concurrently (8 workers ≈ 60-80 properties/min vs ~5/min serial; 1k records in ~15 min)
+- ✅ Live run: **228/1000 enriched with avg 10 Zillow listing photos each**; remaining 727 fell through to Street View + Esri (6 each); 45 insufficient (no Zillow listing AND no Street View panorama)
+- ✅ tranchi-backfill-photos posted 955 records, **361 matched existing tranchi.ai leads and got their image_urls updated** with the upgraded Zillow / Street View photos
+
 **v0.5 — Wichita 1000 + SOP virtual-scroll fix (validated 2026-05-19).**
 - ✅ 1,000 Vacant + High-Equity records pulled from Wichita via BatchData (3 paginated calls × ~333 records)
 - ✅ 991/1000 photo-enriched via the waterfall (Street View 4 + Esri aerial 2 = 6/property)
