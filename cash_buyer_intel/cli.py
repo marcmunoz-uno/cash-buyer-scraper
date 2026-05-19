@@ -609,10 +609,11 @@ def cmd_ingest_batchdata_sellers(json_glob: str, lead_type: str, market: str, ag
 @click.option("--no-zillow", is_flag=True, help="skip BrightData/Zillow stage (use when BrightData zone is broken)")
 @click.option("--no-street-view", is_flag=True)
 @click.option("--no-esri", is_flag=True)
+@click.option("--workers", type=int, default=1, help="concurrent waterfall runs; 5–8 is safe with BrightData Web Unlocker")
 @click.option("--agent", is_flag=True)
 def cmd_enrich_photos(source_table: str, market: str | None, limit: int, min_photos: int,
                        target_photos: int, no_zillow: bool, no_street_view: bool,
-                       no_esri: bool, agent: bool) -> None:
+                       no_esri: bool, workers: int, agent: bool) -> None:
     """Generate property photo URLs via the photo-enrichment-pipeline waterfall.
 
     Waterfall order:
@@ -685,53 +686,57 @@ def cmd_enrich_photos(source_table: str, market: str | None, limit: int, min_pho
     errors: list[str] = []
     source_stats_total: dict[str, int] = {}
 
-    for row in rows:
-        # Extract just the street component from the full address
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+    db_lock = threading.Lock()
+
+    def process(row):
         street = row["full_addr"].split(",")[0].strip()
         result = fetch_photos_waterfall(
             address=street,
             city=row.get("city") or "",
             state=row.get("state") or "",
             zip_code=str(row.get("zip_code") or ""),
-            # Pre-supplied coords skip the slow Census geocoder round-trip
-            # (~3-5s/property → near-zero when lat/lon are provided).
             lat=row.get("latitude"),
             lon=row.get("longitude"),
-            # Zillow PDP URL — without this, the Zillow stage no-ops.
             listing_url=row.get("listing_url"),
             target_photos=target_photos,
             enable_zillow=not no_zillow,
             enable_street_view=not no_street_view,
             enable_esri=not no_esri,
         )
-        if not result.get("ok"):
-            failed += 1
-            for e in (result.get("errors") or []):
-                errors.append(str(e)[:120])
-            continue
+        return row, result
 
-        photos = result.get("photo_urls") or []
-        if len(photos) < min_photos:
-            insufficient += 1
-            continue
-
-        # Per-source primary attribution = the source that returned the most photos
-        ss = result.get("source_stats") or {}
-        for k, v in ss.items():
-            source_stats_total[k] = source_stats_total.get(k, 0) + v
-        primary = max(ss, key=ss.get) if ss else "unknown"
-
-        with open_buyers() as conn:
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO property_photos
-                  (address_norm, image_urls, photo_count, source, source_url)
-                VALUES (?, ?, ?, ?, NULL)
-                """,
-                (row["address_norm"], json.dumps(photos), len(photos), primary),
-            )
-            conn.commit()
-        enriched += 1
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        futures = [ex.submit(process, r) for r in rows]
+        for fut in as_completed(futures):
+            row, result = fut.result()
+            if not result.get("ok"):
+                failed += 1
+                for e in (result.get("errors") or []):
+                    errors.append(str(e)[:120])
+                continue
+            photos = result.get("photo_urls") or []
+            if len(photos) < min_photos:
+                insufficient += 1
+                continue
+            ss = result.get("source_stats") or {}
+            with db_lock:
+                for k, v in ss.items():
+                    source_stats_total[k] = source_stats_total.get(k, 0) + v
+            primary = max(ss, key=ss.get) if ss else "unknown"
+            with db_lock:
+                with open_buyers() as conn:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO property_photos
+                          (address_norm, image_urls, photo_count, source, source_url)
+                        VALUES (?, ?, ?, ?, NULL)
+                        """,
+                        (row["address_norm"], json.dumps(photos), len(photos), primary),
+                    )
+                    conn.commit()
+            enriched += 1
 
     _emit(agent, True,
           {"enriched": enriched, "insufficient_photos": insufficient, "fetch_failed": failed,
