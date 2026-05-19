@@ -609,7 +609,9 @@ def cmd_ingest_batchdata_sellers(json_glob: str, lead_type: str, market: str, ag
 @click.option("--no-zillow", is_flag=True, help="skip BrightData/Zillow stage (use when BrightData zone is broken)")
 @click.option("--no-street-view", is_flag=True)
 @click.option("--no-esri", is_flag=True)
-@click.option("--workers", type=int, default=1, help="concurrent waterfall runs; 5–8 is safe with BrightData Web Unlocker")
+@click.option("--workers", type=int, default=4,
+              help="concurrent waterfall runs (default 4; 8 is safe with BrightData Web Unlocker, "
+                   "drop to 1 for debugging)")
 @click.option("--agent", is_flag=True)
 def cmd_enrich_photos(source_table: str, market: str | None, limit: int, min_photos: int,
                        target_photos: int, no_zillow: bool, no_street_view: bool,
