@@ -599,51 +599,47 @@ def cmd_ingest_batchdata_sellers(json_glob: str, lead_type: str, market: str, ag
 @click.option("--market", default=None, help="filter to a single market")
 @click.option("--limit", type=int, default=250, help="max addresses to enrich this run")
 @click.option("--min-photos", type=int, default=5, help="reject results with fewer than this many photo URLs")
-@click.option("--photo-source", type=click.Choice(["google", "zillow"]), default="google",
-              help='"google" uses Streetview + Static-map (no scraping; works regardless of Zillow availability). '
-                   '"zillow" uses BrightData Web Unlocker on Zillow PDPs.')
+@click.option("--target-photos", type=int, default=10, help="aim for this many photos per property")
+@click.option("--no-zillow", is_flag=True, help="skip BrightData/Zillow stage (use when BrightData zone is broken)")
+@click.option("--no-street-view", is_flag=True)
+@click.option("--no-esri", is_flag=True)
 @click.option("--agent", is_flag=True)
 def cmd_enrich_photos(source_table: str, market: str | None, limit: int, min_photos: int,
-                       photo_source: str, agent: bool) -> None:
-    """Generate 5+ property photo URLs per address.
+                       target_photos: int, no_zillow: bool, no_street_view: bool,
+                       no_esri: bool, agent: bool) -> None:
+    """Generate property photo URLs via the photo-enrichment-pipeline waterfall.
 
-    GOOGLE path (default, reliable, no scraping):
-      4 Streetview headings (0°/90°/180°/270°) + 1 satellite Static-map view.
-      Reads GOOGLE_MAPS_API_KEY from ~/.openclaw/.google_maps_api_key.
-      Each URL is signed and stable; the key is embedded — treat the resulting
-      image_urls as containing a billable API key.
+    Waterfall order:
+      1. Zillow listing photos (BrightData Web Unlocker on Zillow PDPs)
+      2. Google Street View (4 cardinal headings, free per-API-call)
+      3. Esri World Imagery (aerial, free, always returns something)
 
-    ZILLOW path (requires BrightData Web Unlocker):
-      Scrapes the Zillow PDP per address. Returns the listing's real photos.
-      Falls back gracefully when Zillow blocks; today (2026-05-18) BrightData
-      Web Unlocker zone is mis-configured for this account so this path
-      returns empty.
+    Pulls credentials from environment / ~/.openclaw/:
+      - BRIGHTDATA_TOKEN (~/.openclaw/.env) → Zillow stage
+      - GOOGLE_MAPS_KEY (~/.openclaw/.google_maps_api_key) → Street View stage
+
+    Skipping a stage when its credentials are missing is graceful; the
+    waterfall falls through. Esri requires only lat/lon (geocoded via
+    free Census API).
     """
-    import urllib.parse
+    try:
+        from photo_enrichment import fetch_photos_waterfall
+    except ImportError:
+        _emit(agent, False, None,
+              errors=["photo-enrichment-pipeline not installed: pip install -e ~/photo-enrichment-pipeline"]); return
 
-    if photo_source == "google":
+    # Load credentials from openclaw locations if not in env
+    if not os.environ.get("BRIGHTDATA_TOKEN"):
+        env_file = Path.home() / ".openclaw" / ".env"
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                if line.startswith("BRIGHTDATA_TOKEN="):
+                    os.environ["BRIGHTDATA_TOKEN"] = line.split("=", 1)[1].strip()
+                    break
+    if not os.environ.get("GOOGLE_MAPS_KEY"):
         gmaps_key_file = Path.home() / ".openclaw" / ".google_maps_api_key"
-        gmaps_key = (gmaps_key_file.read_text().strip()
-                     if gmaps_key_file.exists() else os.environ.get("GOOGLE_MAPS_API_KEY"))
-        if not gmaps_key:
-            _emit(agent, False, None, errors=["GOOGLE_MAPS_API_KEY not found"]); return
-        token = None  # not needed for google path
-    else:
-        token = os.environ.get("BRIGHTDATA_TOKEN")
-        if not token:
-            env_file = Path.home() / ".openclaw" / ".env"
-            if env_file.exists():
-                for line in env_file.read_text().splitlines():
-                    if line.startswith("BRIGHTDATA_TOKEN="):
-                        token = line.split("=", 1)[1].strip()
-                        break
-        if not token:
-            _emit(agent, False, None, errors=["BRIGHTDATA_TOKEN not set"]); return
-        try:
-            from property_enrichment import fetch_photos_cheap
-        except ImportError:
-            _emit(agent, False, None,
-                  errors=["property_enrichment not installed: pip install -e ~/Property-Scraper-Tranchi"]); return
+        if gmaps_key_file.exists():
+            os.environ["GOOGLE_MAPS_KEY"] = gmaps_key_file.read_text().strip()
 
     where = "1=1"
     params: list = []
@@ -680,58 +676,56 @@ def cmd_enrich_photos(source_table: str, market: str | None, limit: int, min_pho
     insufficient = 0
     failed = 0
     errors: list[str] = []
+    source_stats_total: dict[str, int] = {}
 
     for row in rows:
-        addr_full = ", ".join(filter(None, [
-            row["full_addr"].split(",")[0].strip(),
-            row.get("city") or "", row.get("state") or "", str(row.get("zip_code") or "")
-        ]))
+        # Extract just the street component from the full address
+        street = row["full_addr"].split(",")[0].strip()
+        result = fetch_photos_waterfall(
+            address=street,
+            city=row.get("city") or "",
+            state=row.get("state") or "",
+            zip_code=str(row.get("zip_code") or ""),
+            target_photos=target_photos,
+            enable_zillow=not no_zillow,
+            enable_street_view=not no_street_view,
+            enable_esri=not no_esri,
+        )
+        if not result.get("ok"):
+            failed += 1
+            for e in (result.get("errors") or []):
+                errors.append(str(e)[:120])
+            continue
 
-        if photo_source == "google":
-            loc = urllib.parse.quote_plus(addr_full)
-            photos = [
-                f"https://maps.googleapis.com/maps/api/streetview?size=800x600&location={loc}&heading={h}&fov=80&pitch=0&key={gmaps_key}"
-                for h in (0, 90, 180, 270)
-            ]
-            # 5th photo: satellite static map (overhead view)
-            photos.append(
-                f"https://maps.googleapis.com/maps/api/staticmap?center={loc}&zoom=19&size=800x600&maptype=satellite&key={gmaps_key}"
-            )
-            source_label = "google"
-            source_url = f"https://maps.google.com/?q={loc}"
-        else:
-            slug = urllib.parse.quote(addr_full)
-            zurl = f"https://www.zillow.com/homes/{slug}_rb/"
-            result = fetch_photos_cheap(token, zurl)
-            if not result.get("ok"):
-                failed += 1
-                if result.get("error"):
-                    errors.append(result["error"][:120])
-                continue
-            photos = result.get("photo_urls") or []
-            source_label = "zillow"
-            source_url = zurl
-
+        photos = result.get("photo_urls") or []
         if len(photos) < min_photos:
             insufficient += 1
             continue
+
+        # Per-source primary attribution = the source that returned the most photos
+        ss = result.get("source_stats") or {}
+        for k, v in ss.items():
+            source_stats_total[k] = source_stats_total.get(k, 0) + v
+        primary = max(ss, key=ss.get) if ss else "unknown"
 
         with open_buyers() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO property_photos
                   (address_norm, image_urls, photo_count, source, source_url)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, NULL)
                 """,
-                (row["address_norm"], json.dumps(photos), len(photos), source_label, source_url),
+                (row["address_norm"], json.dumps(photos), len(photos), primary),
             )
             conn.commit()
         enriched += 1
 
     _emit(agent, True,
           {"enriched": enriched, "insufficient_photos": insufficient, "fetch_failed": failed,
-           "min_photos": min_photos, "candidates": len(rows)},
-          errors=errors, meta={"source_table": source_table, "market": market})
+           "min_photos": min_photos, "candidates": len(rows),
+           "source_breakdown": source_stats_total},
+          errors=errors[:10],
+          meta={"source_table": source_table, "market": market, "target_photos": target_photos})
 
 
 @main.command("push-tranchi-leads")
@@ -854,6 +848,97 @@ def cmd_push_tranchi_leads(source_table: str, market: str | None, limit: int,
           {"pushed": len(leads), "exit_code": proc.returncode, "response_head": response_body[:500]},
           errors=[] if response_status == "ok" else [response_body[:500]],
           meta={"source_table": source_table, "market": market})
+
+
+@main.command("tranchi-backfill-photos")
+@click.option("--source-table", type=click.Choice(["motivated_sellers", "cash_sales"]),
+              default="motivated_sellers")
+@click.option("--market", default=None)
+@click.option("--limit", type=int, default=10000)
+@click.option("--min-photos", type=int, default=5)
+@click.option("--dry-run", is_flag=True)
+@click.option("--agent", is_flag=True)
+def cmd_tranchi_backfill_photos(source_table: str, market: str | None, limit: int,
+                                 min_photos: int, dry_run: bool, agent: bool) -> None:
+    """Push image_urls to /api/leads/enrich for properties already in tranchi.
+
+    Use this when push-tranchi-leads reports many addresses as "duplicate"
+    (tranchi already has the lead — they just lack photos). This decorates
+    the existing leads with image_urls so the wholesaler-facing app can
+    render them.
+
+    Driven by the photo-enrichment-pipeline's `tranchi-backfill` CLI.
+    """
+    where = "1=1"
+    params: list = []
+    if market:
+        where += " AND m.market = ?"
+        params.append(market)
+    table = "motivated_sellers" if source_table == "motivated_sellers" else "cash_sales"
+    addr_col = "property_address" if source_table == "motivated_sellers" else "property_address"
+
+    with open_buyers(read_only=True) as conn:
+        if source_table == "motivated_sellers":
+            sql = f"""
+                SELECT m.property_address AS address, p.image_urls
+                  FROM motivated_sellers m
+                  JOIN property_photos p ON p.address_norm = m.property_address_norm
+                 WHERE {where}
+                 LIMIT ?
+            """
+        else:
+            sql = f"""
+                SELECT cs.property_address AS address, p.image_urls
+                  FROM cash_sales cs
+                  JOIN property_photos p ON p.address_norm = cs.property_address_norm
+                 WHERE 1=1 {('AND cs.market = ?' if market else '')}
+                 LIMIT ?
+            """
+        params.append(limit)
+        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    if not rows:
+        _emit(agent, True, {"posted": 0, "skipped": "no candidates"}); return
+
+    items = [{"address": r["address"], "image_urls": json.loads(r["image_urls"])} for r in rows]
+
+    # write to a temp file and shell out to the library CLI
+    import tempfile
+    tf = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    json.dump(items, tf); tf.close()
+
+    # Load TRANCHI_TOKEN from config.toml if not in env
+    if not os.environ.get("TRANCHI_TOKEN"):
+        cfg = Path.home() / ".config" / "tranchi-pp-cli" / "config.toml"
+        if cfg.exists():
+            for line in cfg.read_text().splitlines():
+                if line.startswith("access_token"):
+                    tok = line.split("=", 1)[1].strip().strip("'\"")
+                    if tok:
+                        os.environ["TRANCHI_TOKEN"] = tok
+                        break
+
+    # Resolve the photo-enrichment CLI, including the running interpreter's
+    # bin/ (which is where pip install -e drops the entry point).
+    photo_cli = shutil.which("photo-enrichment") or str(
+        Path(sys.executable).parent / "photo-enrichment")
+    cmd = [photo_cli, "tranchi-backfill", tf.name, "--min-photos", str(min_photos)]
+    if dry_run:
+        cmd.append("--dry-run")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                             env={**os.environ})
+    except FileNotFoundError:
+        _emit(agent, False, None,
+              errors=["photo-enrichment CLI not found — pip install -e ~/photo-enrichment-pipeline"]); return
+
+    try:
+        result = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        result = {"raw_stdout": proc.stdout[:500], "raw_stderr": proc.stderr[:500]}
+
+    _emit(agent, proc.returncode == 0, result,
+          meta={"source_table": source_table, "market": market, "items_file": tf.name})
 
 
 @main.command("sync-county")

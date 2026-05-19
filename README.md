@@ -425,6 +425,11 @@ cash-buyer-intel ingest-propstream \
 - ⚠️ Date-based velocity needs BatchData `deed` dataset or live ATTOM
 - 📋 `push-tranchi` stubbed — production-side `cash_buyers` endpoint pending
 
+**v0.4 — photo-enrichment-pipeline integration + tranchi backfill (validated 2026-05-19).**
+- ✅ `enrich-photos` now uses [`photo-enrichment-pipeline`](https://github.com/marcmunoz-uno/photo-enrichment-pipeline)'s `fetch_photos_waterfall` — Zillow → Street View → Esri aerial. Graceful per-source skipping with `--no-zillow` / `--no-street-view` / `--no-esri`.
+- ✅ `tranchi-backfill-photos` thin wrapper around the library's `tranchi-backfill` CLI — POSTs `{address, image_urls}` to `/api/leads/enrich` for addresses tranchi already has but lacks photos for.
+- ✅ Live run: 246/250 Wichita motivated-seller addresses photo-enriched (~6 photos each — 4 Street View + 2 Esri aerial). 104 of those landed photos on existing tranchi.ai leads via backfill.
+
 **v0.3 — End-to-end photo + tranchi push (validated 2026-05-18 on 250 Wichita leads).**
 - ✅ `ingest-batchdata-sellers` parses paged BatchData JSON into motivated_sellers (price, beds, baths, sqft, year-built all extracted from `listing` block)
 - ✅ `enrich-photos --photo-source google` generates 5 image_urls/property (4 Streetview angles + 1 satellite static-map). $0 marginal cost — uses the shared Google Maps key.
