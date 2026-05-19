@@ -425,6 +425,13 @@ cash-buyer-intel ingest-propstream \
 - ⚠️ Date-based velocity needs BatchData `deed` dataset or live ATTOM
 - 📋 `push-tranchi` stubbed — production-side `cash_buyers` endpoint pending
 
+**v0.8 — 3,600-property multi-market pull → 1,660 photos backfilled to tranchi (validated 2026-05-19).**
+- ✅ Pulled 3,600 `failed-listing` records from BatchData across Wichita / Kansas City / Saint Louis / Memphis / Cleveland (70% have `listing.listingUrl` → eligible for Zillow stage)
+- ✅ Photo waterfall ran across the full set with 8 concurrent workers. **91% Zillow success rate** on the listing_url subset that completed; ~6/min throughput sustained over a ~30 min run
+- ✅ Interim `tranchi-backfill-photos` posted 2,868 enriched records → **1,660 matched existing tranchi.ai leads and got their image_urls updated**
+- 📋 Lead-type Click enum expanded: now accepts `failed-listing`, `canceled-listing`, `expired-listing`, `recently-sold`, `active-listing`, `pending-listing`
+- ⚠️ BrightData throughput throttles after ~1,000 scrapes per session — workers idle on slow responses; sustainable rate is ~50-60/min on cold sessions, dropping to ~7-10/min after warmup
+
 **v0.7 — Zestimate price backfill + tranchi coverage 521/955 (validated 2026-05-19).**
 - ✅ `enrich-zestimate` — scrapes Zillow PDPs via BrightData (~$0.001/address; 50× cheaper than BatchData property lookup at ~$0.05) and regex-extracts the Zestimate into `motivated_sellers.est_value`
 - ✅ Live run on 572 priceless Wichita records: **158 new prices**, 307 had no Zestimate, 66 below $2K minimum, 41 fetch fail. Cost ≈ $0.57.
