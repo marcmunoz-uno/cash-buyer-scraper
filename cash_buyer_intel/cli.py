@@ -817,12 +817,26 @@ def cmd_push_tranchi_leads(source_table: str, market: str | None, limit: int,
     # Tranchi.ai requires `price` (rejects with "price field is null or empty").
     leads = []
     skipped_no_price = 0
+    # Tranchi's on-market QC requires photos sourced directly from the listing
+    # site (Zillow, Realtor, Redfin, auction). Generated URLs (Street View,
+    # Esri aerial, Google Maps static) are explicitly rejected as "fabricated"
+    # — filter them out here. ≥2 listing photos required; ≥5 preferred.
+    LISTING_HOSTS = ("photos.zillowstatic.com", "ssl.cdn-redfin.com",
+                     "ap.rdcpix.com", "rdcpix.com", "img.realtor.com",
+                     "cdn-redfin.com")
+    skipped_no_listing_photos = 0
     for r in rows:
         price = r.get("est_value") or r.get("last_sale_amount")
         if not price:
             skipped_no_price += 1
             continue
-        image_urls = json.loads(r["image_urls"]) if r["image_urls"] else []
+        all_urls = json.loads(r["image_urls"]) if r["image_urls"] else []
+        # Only keep photos from real listing CDNs
+        listing_photos = [u for u in all_urls
+                          if any(h in u for h in LISTING_HOSTS)]
+        if len(listing_photos) < 2:
+            skipped_no_listing_photos += 1
+            continue
         leads.append({
             "address":        r["address"],
             "city":           r["city"],
@@ -834,7 +848,8 @@ def cmd_push_tranchi_leads(source_table: str, market: str | None, limit: int,
             "owner_mailing":  r["owner_mailing_addr"],
             "estimated_value":r["est_value"],
             "last_sale_amount": r["last_sale_amount"],
-            "image_urls":     image_urls,
+            # Tranchi's required field name is `photos` (not `image_urls`).
+            "photos":         listing_photos,
             "source":         "cash-buyer-scraper",
             "external_id":    r["row_id"],
         })
@@ -871,7 +886,9 @@ def cmd_push_tranchi_leads(source_table: str, market: str | None, limit: int,
         conn.commit()
 
     _emit(agent, response_status == "ok",
-          {"pushed": len(leads), "exit_code": proc.returncode, "response_head": response_body[:500]},
+          {"pushed": len(leads), "skipped_no_price": skipped_no_price,
+           "skipped_no_listing_photos": skipped_no_listing_photos,
+           "exit_code": proc.returncode, "response_head": response_body[:500]},
           errors=[] if response_status == "ok" else [response_body[:500]],
           meta={"source_table": source_table, "market": market})
 
@@ -1073,7 +1090,23 @@ def cmd_tranchi_backfill_photos(source_table: str, market: str | None, limit: in
     if not rows:
         _emit(agent, True, {"posted": 0, "skipped": "no candidates"}); return
 
-    items = [{"address": r["address"], "image_urls": json.loads(r["image_urls"])} for r in rows]
+    # Only forward photos from real listing CDNs (Zillow, Realtor, Redfin).
+    # Tranchi's QC explicitly rejects "fabricated" URLs — Street View, Esri,
+    # Google Static Maps. Filter those out before posting to /api/leads/enrich.
+    LISTING_HOSTS = ("photos.zillowstatic.com", "ssl.cdn-redfin.com",
+                     "ap.rdcpix.com", "rdcpix.com", "img.realtor.com",
+                     "cdn-redfin.com")
+    items = []
+    dropped_no_listing = 0
+    for r in rows:
+        urls = [u for u in json.loads(r["image_urls"])
+                if any(h in u for h in LISTING_HOSTS)]
+        if len(urls) < 2:
+            dropped_no_listing += 1
+            continue
+        items.append({"address": r["address"], "image_urls": urls})
+    if not items:
+        _emit(agent, True, {"posted": 0, "dropped_no_listing": dropped_no_listing}); return
 
     # write to a temp file and shell out to the library CLI
     import tempfile
