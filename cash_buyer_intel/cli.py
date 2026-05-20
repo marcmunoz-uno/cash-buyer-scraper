@@ -1040,6 +1040,153 @@ def cmd_enrich_zestimate(source_table: str, market: str | None, limit: int,
           errors=errors[:5], meta={"source_table": source_table, "market": market, "min_price": min_price})
 
 
+@main.command("upgrade-photos-zillow")
+@click.option("--source-table", type=click.Choice(["motivated_sellers", "cash_sales"]),
+              default="motivated_sellers")
+@click.option("--market", default=None)
+@click.option("--limit", type=int, default=5000)
+@click.option("--workers", type=int, default=8,
+              help="concurrent BrightData scrapes (8 is safe on Web Unlocker)")
+@click.option("--min-photos", type=int, default=2,
+              help="require at least this many listing-CDN URLs to overwrite the row")
+@click.option("--agent", is_flag=True)
+def cmd_upgrade_photos_zillow(source_table: str, market: str | None, limit: int,
+                               workers: int, min_photos: int, agent: bool) -> None:
+    """Re-scrape Zillow PDPs to swap Street View / Esri fallbacks for real listing photos.
+
+    Targets rows whose property_photos.image_urls contains zero listing-CDN
+    URLs (i.e. only Street View, Esri, or Maps Static fallbacks). On hit, the
+    row is overwritten with ONLY the listing-CDN photos pulled from Zillow's
+    PDP — making the record eligible for tranchi's on-market QC.
+
+    Misses are left alone so the existing fallback photos stay available for
+    any other downstream consumer.
+    """
+    import re as _re
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+    import urllib.parse
+
+    token = os.environ.get("BRIGHTDATA_TOKEN")
+    if not token:
+        env = Path.home() / ".openclaw" / ".env"
+        if env.exists():
+            for line in env.read_text().splitlines():
+                if line.startswith("BRIGHTDATA_TOKEN="):
+                    token = line.split("=", 1)[1].strip()
+                    break
+    if not token:
+        _emit(agent, False, None, errors=["BRIGHTDATA_TOKEN not set"]); return
+
+    try:
+        from property_enrichment.brightdata import BrightDataMCPClient
+    except ImportError:
+        _emit(agent, False, None, errors=["property_enrichment not installed"]); return
+
+    # Zillow gallery photos are served from photos.zillowstatic.com/fp/<hash>
+    # in several size variants (cc_ft_192/384/576/768/1536, .webp and .jpg).
+    # Capture just the hex hash so we dedupe per slot.
+    PHOTO_RE = _re.compile(r'photos\.zillowstatic\.com/fp/([a-f0-9]{16,})', _re.IGNORECASE)
+    # SQL: rows with photos but no listing-CDN URLs. Photo JSON is a TEXT
+    # column so substring match works.
+    where = ("p.image_urls NOT LIKE '%photos.zillowstatic.com%'"
+             " AND p.image_urls NOT LIKE '%ssl.cdn-redfin.com%'"
+             " AND p.image_urls NOT LIKE '%ap.rdcpix.com%'"
+             " AND p.image_urls NOT LIKE '%img.realtor.com%'")
+    params: list = []
+    if market:
+        where += " AND m.market = ?"
+        params.append(market)
+    table = "motivated_sellers" if source_table == "motivated_sellers" else "cash_sales"
+    listing_col = "m.listing_url" if source_table == "motivated_sellers" else "NULL"
+
+    with open_buyers(read_only=True) as conn:
+        sql = f"""
+            SELECT m.property_address_norm AS address_norm,
+                   m.property_address AS address,
+                   m.city, m.state, m.zip_code,
+                   {listing_col} AS listing_url
+              FROM {table} m
+              JOIN property_photos p ON p.address_norm = m.property_address_norm
+             WHERE {where}
+             LIMIT ?
+        """
+        params.append(limit)
+        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    if not rows:
+        _emit(agent, True, {"updated": 0, "skipped": "no candidates"}); return
+
+    db_lock = threading.Lock()
+    upgraded = 0
+    no_photos_found = 0
+    fetch_failed = 0
+    errors: list[str] = []
+
+    tls = threading.local()
+    def client():
+        if not hasattr(tls, "c"):
+            tls.c = BrightDataMCPClient(token)
+        return tls.c
+
+    def process(row):
+        url = row.get("listing_url")
+        if not url:
+            slug = urllib.parse.quote(", ".join(filter(None, [
+                row["address"].split(",")[0].strip(),
+                row.get("city") or "", row.get("state") or "",
+                str(row.get("zip_code") or "")
+            ])))
+            url = f"https://www.zillow.com/homes/{slug}_rb/"
+        try:
+            html = client().call_tool("scrape_as_html", {"url": url}, timeout=60)
+        except Exception as e:
+            return row, None, f"scrape failed: {e}"[:120]
+        if not html or not isinstance(html, str):
+            return row, None, "empty html"
+        # Dedupe by photo hash; request the 960px jpg variant.
+        seen: set[str] = set()
+        photos = []
+        for m in PHOTO_RE.finditer(html):
+            h = m.group(1).lower()
+            if h in seen:
+                continue
+            seen.add(h)
+            photos.append(f"https://photos.zillowstatic.com/fp/{h}-cc_ft_960.jpg")
+        return row, photos, None
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        futures = [ex.submit(process, r) for r in rows]
+        for fut in as_completed(futures):
+            row, photos, err = fut.result()
+            if err:
+                fetch_failed += 1
+                if len(errors) < 5:
+                    errors.append(err)
+                continue
+            if len(photos) < min_photos:
+                no_photos_found += 1
+                continue
+            with db_lock:
+                with open_buyers() as conn:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO property_photos
+                          (address_norm, image_urls, photo_count, source, source_url)
+                        VALUES (?, ?, ?, 'zillow', NULL)
+                        """,
+                        (row["address_norm"], json.dumps(photos), len(photos)),
+                    )
+                    conn.commit()
+            upgraded += 1
+
+    _emit(agent, True,
+          {"upgraded": upgraded, "no_listing_photos": no_photos_found,
+           "fetch_failed": fetch_failed, "candidates": len(rows)},
+          errors=errors[:5],
+          meta={"source_table": source_table, "market": market, "min_photos": min_photos})
+
+
 @main.command("tranchi-backfill-photos")
 @click.option("--source-table", type=click.Choice(["motivated_sellers", "cash_sales"]),
               default="motivated_sellers")
@@ -1465,29 +1612,98 @@ def cmd_buyers(market, state, min_velocity, max_median_price, property_type,
     })
 
 
-@main.command("push-tranchi")
-@click.option("--top", type=int, default=20)
-@click.option("--market", default=None)
-@click.option("--dry-run", is_flag=True)
-@click.option("--agent", is_flag=True)
-def cmd_push_tranchi(top: int, market: str | None, dry_run: bool, agent: bool) -> None:
-    """POST qualified buyers to tranchi.ai via tranchi-pp-cli.
+TRANCHI_CASH_BUYERS_URL = "https://tranchi.ai/api/cash_buyers"
 
-    See README "Pushing to tranchi.ai" — the tranchi-pp-cli `cash_buyers`
-    resource is not yet generated. Until then this command stubs the call
-    and writes to buyer_outreach with channel='tranchi_push' for accounting.
+
+def _load_tranchi_token() -> str | None:
+    """Return the tranchi bearer token from env or ~/.openclaw/.env."""
+    tok = os.environ.get("TRANCHI_TOKEN")
+    if tok:
+        return tok
+    env_file = Path.home() / ".openclaw" / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            if line.startswith("TRANCHI_TOKEN="):
+                tok = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if tok:
+                    os.environ["TRANCHI_TOKEN"] = tok
+                    return tok
+    return None
+
+
+def _post_tranchi_cash_buyers(payload: list[dict], token: str, timeout: float = 30.0) -> dict:
+    """POST the cash-buyer batch to tranchi.ai and return the parsed envelope.
+
+    Endpoint accepts a JSON array (or single object). Response is the standard
+    {ok, data:{created,updated,errors}, meta:{total,errors:[{index,error}]}}
+    envelope; per-record validation errors come back in meta.errors[].
+    Raises urllib.error.URLError / HTTPError on transport failures.
     """
-    where = ["bs.activity_tier IN ('hot', 'warm')"]
+    import urllib.request
+    import urllib.error
+
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        TRANCHI_CASH_BUYERS_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "cash-buyer-scraper/0.1",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+@main.command("push-tranchi")
+@click.option("--top", type=int, default=20,
+              help="max candidates to consider (after activity-tier filter)")
+@click.option("--market", default=None,
+              help="restrict to buyers with at least one sale in this market")
+@click.option("--batch-size", type=int, default=50,
+              help="records per POST (server accepts arrays)")
+@click.option("--include-cold", is_flag=True,
+              help="also include cold/dormant tiers (default: hot+warm only)")
+@click.option("--dry-run", is_flag=True,
+              help="build the payload but skip the POST; prints the first batch")
+@click.option("--agent", is_flag=True)
+def cmd_push_tranchi(top: int, market: str | None, batch_size: int,
+                     include_cold: bool, dry_run: bool, agent: bool) -> None:
+    """POST qualified buyers to tranchi.ai/api/cash_buyers.
+
+    Direct HTTPS POST with Bearer auth (TRANCHI_TOKEN from env or
+    ~/.openclaw/.env). Batches into arrays of --batch-size; the endpoint
+    is UPSERT-by-external_id so re-runs are idempotent.
+
+    Endpoint schema discovered 2026-05-19:
+      Required: external_id (string), name (string)
+      Optional: phone, email, mailing_address, entity_type, velocity_12m,
+                median_purchase_price, property_type, activity_tier,
+                markets (array), source
+    """
+    token = None if dry_run else _load_tranchi_token()
+    if not dry_run and not token:
+        _emit(agent, False, None,
+              errors=["TRANCHI_TOKEN not set — add to ~/.openclaw/.env or export it"])
+        return
+
+    where = ["bs.activity_tier IN ('hot', 'warm')"] if not include_cold else ["1=1"]
     params: list = []
     if market:
-        where.append("""EXISTS (SELECT 1 FROM cash_sales cs WHERE cs.entity_id = be.entity_id AND cs.market = ?)""")
+        where.append("EXISTS (SELECT 1 FROM cash_sales cs WHERE cs.entity_id = be.entity_id AND cs.market = ?)")
         params.append(market)
     params.append(top)
 
     sql = f"""
     SELECT be.entity_id, be.canonical_name, be.entity_type, be.primary_mailing,
            bs.velocity_12m, bs.median_purchase_price, bs.property_type_mode,
-           bc.primary_phone, bc.primary_email
+           bs.activity_tier, bs.recency_score,
+           bc.primary_phone, bc.primary_email,
+           (SELECT GROUP_CONCAT(DISTINCT cs.market)
+              FROM cash_sales cs
+             WHERE cs.entity_id = be.entity_id AND cs.market IS NOT NULL) AS markets_csv
       FROM buyer_entities be
       JOIN buyer_scores bs ON bs.entity_id = be.entity_id
  LEFT JOIN buyer_contacts bc ON bc.entity_id = be.entity_id
@@ -1499,47 +1715,92 @@ def cmd_push_tranchi(top: int, market: str | None, dry_run: bool, agent: bool) -
     with open_buyers() as conn:
         rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
 
+        def build_record(r: dict) -> dict:
+            rec = {
+                "external_id":  r["entity_id"],
+                "name":         r["canonical_name"],
+                "source":       "cash-buyer-scraper",
+            }
+            if r.get("primary_phone"):           rec["phone"] = r["primary_phone"]
+            if r.get("primary_email"):           rec["email"] = r["primary_email"]
+            if r.get("primary_mailing"):         rec["mailing_address"] = r["primary_mailing"]
+            if r.get("entity_type"):             rec["entity_type"] = r["entity_type"]
+            if r.get("velocity_12m") is not None: rec["velocity_12m"] = r["velocity_12m"]
+            if r.get("median_purchase_price"):   rec["median_purchase_price"] = r["median_purchase_price"]
+            if r.get("property_type_mode"):      rec["property_type"] = r["property_type_mode"]
+            if r.get("activity_tier"):           rec["activity_tier"] = r["activity_tier"]
+            if r.get("markets_csv"):
+                rec["markets"] = [m.strip() for m in r["markets_csv"].split(",") if m.strip()]
+            return rec
+
+        payload = [build_record(r) for r in rows]
+
         if dry_run:
-            _emit(agent, True, rows, meta={"dry_run": True, "would_push": len(rows)})
+            _emit(agent, True,
+                  {"candidates": len(payload),
+                   "first_batch_preview": payload[:batch_size]},
+                  meta={"dry_run": True, "batch_size": batch_size,
+                        "url": TRANCHI_CASH_BUYERS_URL})
             return
 
-        pushed = 0
-        errors: list[str] = []
-        for r in rows:
+        if not payload:
+            _emit(agent, True, {"pushed": 0, "candidates": 0},
+                  meta={"note": "no buyers match the filter"})
+            return
+
+        # Batch POST and accumulate results.
+        import urllib.error
+        created = updated = err_count = 0
+        per_record_errors: list[dict] = []
+        transport_errors: list[str] = []
+
+        for start in range(0, len(payload), batch_size):
+            batch = payload[start:start + batch_size]
             try:
-                subprocess.run(
-                    [_pp_bin("tranchi-pp-cli"), "cash-buyers", "upload",
-                     "--external-id", r["entity_id"],
-                     "--name", r["canonical_name"],
-                     "--phone", r.get("primary_phone") or "",
-                     "--email", r.get("primary_email") or "",
-                     "--velocity-12m", str(r["velocity_12m"]),
-                     "--median-price", str(r.get("median_purchase_price") or 0),
-                     "--property-type", r.get("property_type_mode") or "",
-                     "--agent"],
-                    check=True, capture_output=True, text=True,
-                )
-            except FileNotFoundError:
-                errors.append("tranchi-pp-cli not found on PATH — see README 'Pushing to tranchi.ai'")
-                break
-            except subprocess.CalledProcessError as e:
-                errors.append(f"push failed for {r['entity_id']}: {e.stderr[:200]}")
+                resp = _post_tranchi_cash_buyers(batch, token)
+            except urllib.error.HTTPError as e:
+                transport_errors.append(f"batch {start}-{start+len(batch)}: HTTP {e.code} — {e.read()[:200].decode('utf-8', 'replace')}")
+                continue
+            except (urllib.error.URLError, OSError) as e:
+                transport_errors.append(f"batch {start}-{start+len(batch)}: transport error — {e}")
                 continue
 
-            conn.execute(
-                """
-                INSERT INTO buyer_outreach
-                  (entity_id, channel, direction, summary, response_status)
-                VALUES (?, 'tranchi_push', 'out', 'pushed via tranchi-pp-cli', 'pending')
-                """,
-                (r["entity_id"],),
-            )
-            pushed += 1
+            data = resp.get("data") or {}
+            created   += int(data.get("created") or 0)
+            updated   += int(data.get("updated") or 0)
+            err_count += int(data.get("errors")  or 0)
+
+            # The server reports per-record errors against the *batch* index.
+            # Translate back to the global index + the actual external_id.
+            for er in (resp.get("meta") or {}).get("errors", []):
+                bi = er.get("index", -1)
+                eid = batch[bi]["external_id"] if 0 <= bi < len(batch) else None
+                per_record_errors.append({"external_id": eid, "error": er.get("error")})
+
+            # Log successful pushes to buyer_outreach so subsequent runs can
+            # exclude them with --no-recent-outreach (existing pattern).
+            err_indices = {er.get("index") for er in (resp.get("meta") or {}).get("errors", [])}
+            for i, rec in enumerate(batch):
+                if i in err_indices:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO buyer_outreach
+                      (entity_id, channel, direction, summary, response_status)
+                    VALUES (?, 'tranchi_push', 'out',
+                            'POST /api/cash_buyers (direct)', 'pushed')
+                    """,
+                    (rec["external_id"],),
+                )
         conn.commit()
 
-    _emit(agent, not errors or pushed > 0,
-          {"pushed": pushed, "candidates": len(rows)},
-          errors=errors, meta={"top": top, "market": market})
+    ok = not transport_errors and (created + updated) > 0
+    _emit(agent, ok,
+          {"created": created, "updated": updated, "errors": err_count,
+           "candidates": len(payload), "per_record_errors": per_record_errors},
+          errors=transport_errors,
+          meta={"top": top, "market": market, "batch_size": batch_size,
+                "url": TRANCHI_CASH_BUYERS_URL})
 
 
 @main.command("outreach-log")

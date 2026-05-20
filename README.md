@@ -417,6 +417,18 @@ cash-buyer-intel ingest-propstream \
 
 ## Status and roadmap
 
+**v0.14 — Zillow PDP re-scrape upgrades 577 Street-View records → listing-CDN photos.**
+- New command `upgrade-photos-zillow` — for rows whose `image_urls` JSON contains zero listing-CDN URLs (i.e. only Street View + Esri fallbacks), re-scrapes the Zillow PDP via BrightData and replaces the row with just the `photos.zillowstatic.com` gallery URLs.
+- Live run on the 3,068-record non-listing cohort: **577 upgraded (19% hit rate), 2,304 had no Zillow listing (off-market / never-listed), 187 fetch failed.** At ~$0.001/scrape ≈ **$3 total cost**.
+- Listing-CDN cohort grew **1,378 → 1,956** (+578). Re-pushed to `/api/leads/enrich`: **1,206 enriched** (up from 678 pre-upgrade; +528 newly photo-eligible). 0 rate-limit failures — under the per-window cap.
+- Re-push to `POST /api/leads`: 1,196 attempted, all returned `duplicate` (tranchi already has every address in our DB). Photo backfill is the only path forward — no net-new leads.
+- Tranchi `leads stats` unchanged at active 4,378 / archived 13,291 / total 17,669. Active count requires the tranchi-side re-eval pipeline to re-process now-photo-decorated archived leads (Manus running on their side).
+
+**v0.13 — Tranchi QC compliance: `photos` field + listing-CDN filter.**
+- Tranchi team confirmed (a) `POST /api/leads` requires the field name `photos`, not `image_urls`, and (b) URLs must come from real listing CDNs (Zillow, Realtor, Redfin, auction). Generated URLs (Street View, Esri, Maps Static) are rejected as fabricated.
+- Patched both `push-tranchi-leads` and `tranchi-backfill-photos` to filter to a `LISTING_HOSTS` allowlist before posting and rename the field. Pre-patch: 4,399 photo-enriched records had 1,341 with ≥2 listing-CDN photos. Post-patch backfill: 1,368 posted, **678 matched, 690 not_found**.
+- During this session: tranchi active 2,761 → 4,378 (+1,617). Most of that lines up with the post-fix re-eval + photo backfill.
+
 **v0.1 — BatchData tier A, end-to-end validated.**
 - ✅ BatchData sync (paged) + owned-cache + cash_sales projection
 - ✅ Entity resolution (exact-match + fuzzy + entity-type classifier)
