@@ -2,6 +2,8 @@
 
 Standard Operating Procedures for driving PropStream's web UI via [browser-harness](https://github.com/browser-use/browser-harness) and ingesting the results into `cash_buyer_intel`. Uses the account-holder's existing subscription — **$0 marginal API cost** unless skip-trace is explicitly enabled.
 
+> **Mirror:** these SOPs and the ingest CLI are also published as a standalone tool at [`marcmunoz-uno/propstream-scraper`](https://github.com/marcmunoz-uno/propstream-scraper) (private). The standalone is useful when you want PropStream → SQLite without the rest of the cash-buyer-intel mesh (no ATTOM, BatchData, dedup, scoring, tranchi push). If you change a SOP here, mirror it there.
+
 ## SOPs
 
 | SOP | Lead-list type | Status |

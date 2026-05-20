@@ -393,7 +393,7 @@ PropStream has no API but its web UI exports cash-buyer lists as XLSX. We drive 
 
 Validated 2026-05-18 on ZIP 63116: 2,559 rows × 75 columns. 100% sale-date coverage, 79% sale-price coverage, 98% open-loan-count (defensive cash-buyer check — 469 of PropStream's "cash buyers" had open loans and were rejected on ingest).
 
-SOP: [docs/propstream/export-cash-buyers.md](docs/propstream/export-cash-buyers.md)
+SOP: [docs/propstream/export-cash-buyers.md](docs/propstream/export-cash-buyers.md). The same SOPs and ingest CLI are also published standalone at [`marcmunoz-uno/propstream-scraper`](https://github.com/marcmunoz-uno/propstream-scraper) for use without the rest of this mesh.
 
 ```bash
 # After running the SOP and downloading the XLSX:
@@ -407,6 +407,7 @@ cash-buyer-intel ingest-propstream \
 | Repo | Role |
 |---|---|
 | [`SQLite-CLI-propertydb-mesh`](https://github.com/marcmunoz-uno/SQLite-CLI-propertydb-mesh) | Sister mesh — same pattern, property-side. Shares the PP CLI fleet. |
+| [`propstream-scraper`](https://github.com/marcmunoz-uno/propstream-scraper) | Standalone mirror of the PropStream SOPs + ingest CLI — usable without the rest of this mesh. Kept in lockstep. |
 | [`cli-printing-press`](https://github.com/mvanhorn/cli-printing-press) | Layer 1 generator. Not vendored. |
 | `county-portal-scraper` | Tier B source — feeds deed records for the 32 markets / 71 portals already cracked. |
 | [`tranchi-deal-flow-agents`](https://github.com/marcmunoz-uno/tranchi-deal-flow-agents) | The bridge for production push (path 2 in [Pushing to tranchi.ai](#pushing-to-tranchiai)). |
@@ -424,6 +425,13 @@ cash-buyer-intel ingest-propstream \
 - ⚠️ ATTOM stubbed — paid key needed before `sync-attom` lights up
 - ⚠️ Date-based velocity needs BatchData `deed` dataset or live ATTOM
 - 📋 `push-tranchi` stubbed — production-side `cash_buyers` endpoint pending
+
+**v0.11 — Loop fire #2: backfill ran ~11 min, tranchi active +379, archived +536, total +915.**
+- After ~42 min cooldown, `tranchi-backfill-photos` accepted batches again
+- Ran for ~11 min processing chunks, then hung on a stuck network call at 0% CPU (had to kill)
+- Tranchi state delta during the window: active **2,974 → 3,353** (+379), archived **13,574 → 14,110** (+536), total **16,548 → 17,463** (+915)
+- Some of that delta is our backfill triggering re-eval; some is tranchi's own pipelines running in parallel
+- **Loop stopping here** — diminishing returns per backfill attempt + each attempt now hangs near the end. Next-best lever is the QC-gate prompt I drafted for tranchi to surface archived → active.
 
 **v0.10 — Loop iteration: tranchi rate-limit is *per-attempt*, not per-clock.**
 - Snapshot at this iteration:
