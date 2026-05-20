@@ -426,6 +426,12 @@ cash-buyer-intel ingest-propstream \
 - ⚠️ Date-based velocity needs BatchData `deed` dataset or live ATTOM
 - 📋 `push-tranchi` stubbed — production-side `cash_buyers` endpoint pending
 
+**v0.12 — Loop fire #3 after tranchi address-parser fix: +994 archived→active on tranchi.**
+- Tranchi team deployed (a) an address-parser fix (NE/SE/SW/NW/CT were being misread as state codes) and (b) a re-evaluation system that auto-graduates archived leads when their inputs change.
+- Re-ran the hardened chunked backfill (`urlopen timeout=30`, sleep on 429, log every 5 batches, save each batch). Hit 429 at batch 2900/4457 with retryAfter=3218s, script sleeping through that window then resuming.
+- Partial results before sleep: **matched=670+** distinct addresses got their `image_urls` posted.
+- Tranchi state during the run: **active 3,353 → 4,347** (+994), **archived 14,110 → 13,116** (-994). Net: ~1,000 leads moved from archived (hidden) → active (visible). Total unchanged (17,463) — this is pure re-eval, not new imports.
+
 **v0.11 — Loop fire #2: backfill ran ~11 min, tranchi active +379, archived +536, total +915.**
 - After ~42 min cooldown, `tranchi-backfill-photos` accepted batches again
 - Ran for ~11 min processing chunks, then hung on a stuck network call at 0% CPU (had to kill)
