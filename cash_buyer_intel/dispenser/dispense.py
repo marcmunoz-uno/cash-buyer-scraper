@@ -28,27 +28,41 @@ BATCHDATA_FULL_ENRICHMENT_COST = 0.077
 def _row_to_buyer(r: sqlite3.Row) -> dict[str, Any]:
     """Shape a buyer_entities row into the dispense payload.
 
-    Mirrors `cli.cmd_push_tranchi.build_record()` so callers see the same
-    fields whether they pull from the dispenser API or the push-tranchi flow.
+    Mirrors `cli.cmd_push_tranchi.build_record()` and the field reference in
+    `Cash Buyer Pool Upload API — Documentation.md` so callers see exactly the
+    same record format whether they pull from the dispenser API or get one
+    pushed via the bulk operator workflow.
     """
-    markets_csv = r["markets_csv"] or ""
-    markets = [m.strip() for m in markets_csv.split(",") if m.strip()]
-    rec = {
-        "external_id":     r["entity_id"],
-        "name":            r["canonical_name"],
-        "phone":           r["primary_phone"],
-        "email":           r["primary_email"],
-        "markets":         markets,
-        "source":          "cash-buyer-scraper",
+    rec: dict[str, Any] = {
+        "external_id": r["entity_id"],
+        "name":        r["canonical_name"],
+        "source":      "cash-buyer-scraper",
+        "phone":       r["primary_phone"],
+        "email":       r["primary_email"],
+        "market":      r["market"],
+        "state":       r["state"],
     }
-    if r["primary_mailing"]:        rec["mailing_address"] = r["primary_mailing"]
-    if r["entity_type"]:            rec["entity_type"] = r["entity_type"]
-    if r["velocity_12m"] is not None: rec["velocity_12m"] = r["velocity_12m"]
-    if r["median_purchase_price"] is not None:
-        rec["median_purchase_price"] = r["median_purchase_price"]
-    if r["property_type_mode"]:     rec["property_type"] = r["property_type_mode"]
-    if r["activity_tier"]:          rec["activity_tier"] = r["activity_tier"]
-    if r["confidence"] is not None: rec["skip_trace_confidence"] = r["confidence"]
+    for k_src, k_api in (
+        ("primary_mailing",              "mailing_address"),
+        ("entity_type",                  "entity_type"),
+        ("llc_authorized_agent",         "llc_agent"),
+        ("total_sales",                  "total_sales"),
+        ("velocity_12m",                 "velocity_12m"),
+        ("velocity_3m",                  "velocity_3m"),
+        ("median_purchase_price",        "median_price"),
+        ("p25_price",                    "p25_price"),
+        ("p75_price",                    "p75_price"),
+        ("property_type_mode",           "property_type_mode"),
+        ("zip_cluster_centroid_lat",     "zip_cluster_lat"),
+        ("zip_cluster_centroid_lon",     "zip_cluster_lon"),
+        ("zip_cluster_radius_miles",     "zip_cluster_radius"),
+        ("recency_score",                "recency_score"),
+        ("activity_tier",                "activity_tier"),
+        ("confidence",                   "confidence"),
+    ):
+        v = r[k_src] if k_src in r.keys() else None
+        if v is not None and v != "":
+            rec[k_api] = v
     return rec
 
 
@@ -87,12 +101,21 @@ def dispense_from_cache(
 
     sql = """
     SELECT be.entity_id, be.canonical_name, be.entity_type, be.primary_mailing,
-           bs.velocity_12m, bs.median_purchase_price, bs.property_type_mode,
+           be.total_sales,
+           bs.velocity_12m, bs.velocity_3m,
+           bs.median_purchase_price, bs.p25_price, bs.p75_price,
+           bs.property_type_mode,
+           bs.zip_cluster_centroid_lat, bs.zip_cluster_centroid_lon,
+           bs.zip_cluster_radius_miles,
            bs.activity_tier, bs.recency_score,
-           bc.primary_phone, bc.primary_email, bc.confidence,
-           (SELECT GROUP_CONCAT(DISTINCT cs.market)
-              FROM cash_sales cs
-             WHERE cs.entity_id = be.entity_id AND cs.market IS NOT NULL) AS markets_csv
+           bc.primary_phone, bc.primary_email,
+           bc.llc_authorized_agent, bc.confidence,
+           (SELECT cs.market FROM cash_sales cs
+             WHERE cs.entity_id = be.entity_id AND cs.market IS NOT NULL
+             ORDER BY cs.sale_date DESC LIMIT 1) AS market,
+           (SELECT cs.state  FROM cash_sales cs
+             WHERE cs.entity_id = be.entity_id AND cs.state  IS NOT NULL
+             ORDER BY cs.sale_date DESC LIMIT 1) AS state
       FROM buyer_entities be
       JOIN buyer_scores bs   ON bs.entity_id = be.entity_id
       JOIN buyer_contacts bc ON bc.entity_id = be.entity_id

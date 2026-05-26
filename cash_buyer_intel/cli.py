@@ -1712,7 +1712,8 @@ def _load_tranchi_token() -> str | None:
 def _post_tranchi_cash_buyers(payload: list[dict], token: str, timeout: float = 30.0) -> dict:
     """POST the cash-buyer batch to tranchi.ai and return the parsed envelope.
 
-    Endpoint accepts a JSON array (or single object). Response is the standard
+    Wraps the batch in `{"buyers": [...]}` — the recommended format per the
+    Cash Buyer Pool Upload API docs. Response is the standard
     {ok, data:{created,updated,errors}, meta:{total,errors:[{index,error}]}}
     envelope; per-record validation errors come back in meta.errors[].
     Raises urllib.error.URLError / HTTPError on transport failures.
@@ -1720,7 +1721,7 @@ def _post_tranchi_cash_buyers(payload: list[dict], token: str, timeout: float = 
     import urllib.request
     import urllib.error
 
-    body = json.dumps(payload).encode("utf-8")
+    body = json.dumps({"buyers": payload}).encode("utf-8")
     req = urllib.request.Request(
         TRANCHI_CASH_BUYERS_URL,
         data=body,
@@ -1779,14 +1780,27 @@ def cmd_push_tranchi(top: int, market: str | None, batch_size: int,
         where.append("(bc.primary_phone IS NOT NULL OR bc.primary_email IS NOT NULL)")
     params.append(top)
 
+    # SQL aligns with the field mapping in the Cash Buyer Pool Upload API doc.
+    # market/state come from the buyer's most-recent cash_sale; total_sales is
+    # carried on buyer_entities; zip_cluster_* + p25/p75/recency_score live on
+    # buyer_scores; llc_agent + confidence live on buyer_contacts.
     sql = f"""
     SELECT be.entity_id, be.canonical_name, be.entity_type, be.primary_mailing,
-           bs.velocity_12m, bs.median_purchase_price, bs.property_type_mode,
+           be.total_sales,
+           bs.velocity_12m, bs.velocity_3m,
+           bs.median_purchase_price, bs.p25_price, bs.p75_price,
+           bs.property_type_mode,
+           bs.zip_cluster_centroid_lat, bs.zip_cluster_centroid_lon,
+           bs.zip_cluster_radius_miles,
            bs.activity_tier, bs.recency_score,
            bc.primary_phone, bc.primary_email,
-           (SELECT GROUP_CONCAT(DISTINCT cs.market)
-              FROM cash_sales cs
-             WHERE cs.entity_id = be.entity_id AND cs.market IS NOT NULL) AS markets_csv
+           bc.llc_authorized_agent, bc.confidence,
+           (SELECT cs.market FROM cash_sales cs
+             WHERE cs.entity_id = be.entity_id AND cs.market IS NOT NULL
+             ORDER BY cs.sale_date DESC LIMIT 1) AS market,
+           (SELECT cs.state  FROM cash_sales cs
+             WHERE cs.entity_id = be.entity_id AND cs.state  IS NOT NULL
+             ORDER BY cs.sale_date DESC LIMIT 1) AS state
       FROM buyer_entities be
       JOIN buyer_scores bs ON bs.entity_id = be.entity_id
  LEFT JOIN buyer_contacts bc ON bc.entity_id = be.entity_id
@@ -1799,21 +1813,43 @@ def cmd_push_tranchi(top: int, market: str | None, batch_size: int,
         rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
 
         def build_record(r: dict) -> dict:
-            markets = [m.strip() for m in (r.get("markets_csv") or "").split(",") if m.strip()]
-            rec = {
-                "external_id":  r["entity_id"],
-                "name":         r["canonical_name"],
-                "source":       "cash-buyer-scraper",
-                "phone":        r.get("primary_phone"),
-                "email":        r.get("primary_email"),
-                "markets":      markets,
+            """Shape a row into the API payload defined in
+            `Cash Buyer Pool Upload API — Documentation.md`. Required fields
+            are always present; optional fields are only included when we have
+            a non-null value (avoids sending `"foo": null` for every column)."""
+            rec: dict = {
+                "external_id": r["entity_id"],
+                "name":        r["canonical_name"],
+                "source":      "cash-buyer-scraper",
+                # Critical for matching — must be present even if null so the
+                # receiver's parser sees a stable schema.
+                "phone":  r.get("primary_phone"),
+                "email":  r.get("primary_email"),
+                "market": r.get("market"),
+                "state":  r.get("state"),
             }
-            if r.get("primary_mailing"):         rec["mailing_address"] = r["primary_mailing"]
-            if r.get("entity_type"):             rec["entity_type"] = r["entity_type"]
-            if r.get("velocity_12m") is not None: rec["velocity_12m"] = r["velocity_12m"]
-            if r.get("median_purchase_price"):   rec["median_purchase_price"] = r["median_purchase_price"]
-            if r.get("property_type_mode"):      rec["property_type"] = r["property_type_mode"]
-            if r.get("activity_tier"):           rec["activity_tier"] = r["activity_tier"]
+            # Optional — only ship when we have data.
+            for k_src, k_api in (
+                ("primary_mailing",              "mailing_address"),
+                ("entity_type",                  "entity_type"),
+                ("llc_authorized_agent",         "llc_agent"),
+                ("total_sales",                  "total_sales"),
+                ("velocity_12m",                 "velocity_12m"),
+                ("velocity_3m",                  "velocity_3m"),
+                ("median_purchase_price",        "median_price"),
+                ("p25_price",                    "p25_price"),
+                ("p75_price",                    "p75_price"),
+                ("property_type_mode",           "property_type_mode"),
+                ("zip_cluster_centroid_lat",     "zip_cluster_lat"),
+                ("zip_cluster_centroid_lon",     "zip_cluster_lon"),
+                ("zip_cluster_radius_miles",     "zip_cluster_radius"),
+                ("recency_score",                "recency_score"),
+                ("activity_tier",                "activity_tier"),
+                ("confidence",                   "confidence"),
+            ):
+                v = r.get(k_src)
+                if v is not None and v != "":
+                    rec[k_api] = v
             return rec
 
         payload = [build_record(r) for r in rows]

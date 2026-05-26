@@ -108,21 +108,35 @@ Response (cache short — async fetch kicked off):
 
 #### Buyer record shape
 
-Matches `push-tranchi`'s payload at `cli.py::build_record()`:
+Matches the **Cash Buyer Pool Upload API** spec — the same record format `push-tranchi` sends to `POST /api/cash_buyers`. Required fields are always present (may be null); optional fields are only included when we have a non-null value.
 
 ```jsonc
 {
-  "external_id":     "ent_363b96f48566100c",
-  "name":            "ALAIA HOLDINGS",
-  "phone":           "2163039406",                // real, from BatchData skip-trace
-  "email":           "greeneteague1114@gmail.com",
-  "markets":         ["Cleveland OH"],
+  "external_id":     "ent_363b96f48566100c",      // required
+  "name":            "ALAIA HOLDINGS",            // required
   "source":          "cash-buyer-scraper",
+  // Critical for matching — always present, may be null
+  "phone":           "2163039406",                // from BatchData skip-trace
+  "email":           "greeneteague1114@gmail.com",
+  "market":          "Cleveland OH",              // singular string, not array
+  "state":           "OH",
+  // Optional — only included when we have data
   "mailing_address": "13940 Cedar Rd, Cleveland, OH, 44118",
   "entity_type":     "llc",
+  "llc_agent":       "...",
+  "total_sales":     3,
   "velocity_12m":    3,
+  "velocity_3m":     0,
+  "median_price":    185000,
+  "p25_price":       95000,
+  "p75_price":       280000,
+  "property_type_mode": "single_family",
+  "zip_cluster_lat":    41.50,
+  "zip_cluster_lon":   -81.69,
+  "zip_cluster_radius": 12.0,
+  "recency_score":   0.95,
   "activity_tier":   "warm",
-  "skip_trace_confidence": 0.9
+  "confidence":      0.9
 }
 ```
 
