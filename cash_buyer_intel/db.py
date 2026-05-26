@@ -334,6 +334,41 @@ CREATE TABLE IF NOT EXISTS batchdata_cache (
     owner_state      TEXT,
     fetched_at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- One row per buyer dispensed to a user via the on-demand HTTP service.
+-- UNIQUE (user_id, entity_id) guarantees no buyer is dispensed twice to the
+-- same user. cost_usd is OUR raw BatchData cost — the caller (Tranchi) applies
+-- whatever markup their billing system uses.
+CREATE TABLE IF NOT EXISTS dispenses (
+    dispense_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       TEXT NOT NULL,
+    entity_id     TEXT NOT NULL,
+    job_id        TEXT,
+    source        TEXT NOT NULL,            -- 'cache' | 'fetch'
+    cost_usd      REAL NOT NULL DEFAULT 0.0,
+    dispensed_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (user_id, entity_id)
+);
+CREATE INDEX IF NOT EXISTS dispenses_user    ON dispenses(user_id);
+CREATE INDEX IF NOT EXISTS dispenses_entity  ON dispenses(entity_id);
+CREATE INDEX IF NOT EXISTS dispenses_job     ON dispenses(job_id);
+
+-- One row per async dispense job — when the cache can't fulfill the request
+-- and we have to go to BatchData. status: 'queued' -> 'running' -> 'complete' | 'failed'
+CREATE TABLE IF NOT EXISTS dispense_jobs (
+    job_id          TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL,
+    request_json    TEXT NOT NULL,          -- raw dispense request (market, quantity, filters)
+    status          TEXT NOT NULL,          -- queued | running | complete | failed
+    cached_count    INTEGER NOT NULL DEFAULT 0,
+    fetched_count   INTEGER NOT NULL DEFAULT 0,
+    total_cost_usd  REAL NOT NULL DEFAULT 0.0,
+    error           TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS dispense_jobs_user   ON dispense_jobs(user_id);
+CREATE INDEX IF NOT EXISTS dispense_jobs_status ON dispense_jobs(status);
 """
 
 

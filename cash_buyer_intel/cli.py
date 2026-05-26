@@ -73,6 +73,36 @@ def cmd_init_db(agent: bool) -> None:
     _emit(agent, True, {"path": str(BUYERS_DB)}, meta={"action": "init_db"})
 
 
+@main.command("serve")
+@click.option("--host", default="127.0.0.1", help="bind host (use 0.0.0.0 to expose externally)")
+@click.option("--port", type=int, default=8765, help="bind port")
+@click.option("--reload", is_flag=True, help="autoreload on code changes (dev only)")
+@click.option("--workers", type=int, default=1, help="uvicorn worker processes")
+def cmd_serve(host: str, port: int, reload: bool, workers: int) -> None:
+    """Start the on-demand cash-buyer dispenser HTTP server.
+
+    Requires the `[dispenser]` extra:  pip install -e ".[dispenser]"
+    Requires DISPENSER_TOKEN in env or ~/.openclaw/.env.
+
+    Endpoints (under /api/dispense — see docs/dispenser.md for the contract):
+      POST  /api/dispense                — request N buyers for a user
+      GET   /api/dispense/jobs/{id}      — poll an async fulfillment job
+      GET   /api/dispense/stock          — cache stock for market + user
+      GET   /api/dispense/history        — already-dispensed buyers for a user
+      GET   /healthz
+    """
+    try:
+        import uvicorn
+    except ImportError:
+        click.echo("error: uvicorn not installed. Run: pip install -e '.[dispenser]'",
+                   err=True)
+        sys.exit(1)
+    uvicorn.run(
+        "cash_buyer_intel.dispenser.api:app",
+        host=host, port=port, reload=reload, workers=(workers if not reload else 1),
+    )
+
+
 @main.command("probe")
 @click.option("--agent", is_flag=True)
 def cmd_probe(agent: bool) -> None:
@@ -1452,8 +1482,12 @@ def _apply_lookup_results(props: list[dict], batch: list[dict]) -> int:
 @click.option("--limit", type=int, default=200)
 @click.option("--agent", is_flag=True)
 def cmd_enrich_batchdata(limit: int, agent: bool) -> None:
-    """Skip-trace any cash_sales buyer that has no buyer_contacts row yet."""
-    enriched = 0
+    """Skip-trace any cash_sales buyer that has no buyer_contacts row yet.
+
+    Calls `batchdata-pp-cli property skip-trace --requests <JSON>` per buyer.
+    Picks best phone (non-DNC, reachable, highest score) and best email
+    (tested first). Writes to buyer_contacts.
+    """
     with open_buyers() as conn:
         targets = conn.execute(
             """
@@ -1467,43 +1501,87 @@ def cmd_enrich_batchdata(limit: int, agent: bool) -> None:
             """,
             (limit,),
         ).fetchall()
+        targets = [dict(t) for t in targets]
+
+    attempted = 0
+    matched = 0
+    with_phone = 0
+    with_email = 0
+    unparseable = 0
+    errors: list[str] = []
 
     for t in targets:
         addr = t["buyer_mailing_addr"]
+        parts = [p.strip() for p in (addr or "").split(",") if p.strip()]
+        if len(parts) < 4:
+            unparseable += 1
+            continue
+        request = {"propertyAddress": {
+            "street": ", ".join(parts[:-3]),
+            "city":   parts[-3],
+            "state":  parts[-2],
+            "zip":    parts[-1],
+        }}
+
+        attempted += 1
         try:
             proc = subprocess.run(
-                [_pp_bin("batchdata-pp-cli"), "property", "skip-trace", "--address", addr, "--agent"],
-                check=True, capture_output=True, text=True,
+                [_pp_bin("batchdata-pp-cli"), "property", "skip-trace",
+                 "--requests", json.dumps([request]), "--agent"],
+                check=True, capture_output=True, text=True, timeout=60,
             )
-        except (FileNotFoundError, subprocess.CalledProcessError):
+        except FileNotFoundError:
+            errors.append("batchdata-pp-cli not found on PATH")
+            break
+        except subprocess.CalledProcessError as e:
+            errors.append(f"{t['entity_id']}: {e.stderr[:120].strip()}")
             continue
 
         try:
             payload = json.loads(proc.stdout)
         except json.JSONDecodeError:
+            errors.append(f"{t['entity_id']}: non-JSON response")
             continue
 
-        data = (payload or {}).get("data") or {}
+        persons = (((payload.get("data") or {}).get("results") or {}).get("persons")) or []
+        if not persons:
+            continue
+        person = persons[0]
+
+        phones = sorted(
+            person.get("phoneNumbers") or [],
+            key=lambda p: (not p.get("dnc", False), bool(p.get("reachable")), int(p.get("score") or 0)),
+            reverse=True,
+        )
+        primary_phone = phones[0]["number"] if phones else None
+        confidence = (int(phones[0].get("score") or 0) / 100.0) if phones else None
+
+        emails = sorted(
+            person.get("emails") or [],
+            key=lambda e: bool(e.get("tested")), reverse=True,
+        )
+        primary_email = emails[0]["email"] if emails else None
+
         with open_buyers() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO buyer_contacts
                   (entity_id, primary_phone, primary_email, llc_authorized_agent,
                    skip_traced_at, confidence)
-                VALUES (?, ?, ?, ?, datetime('now'), ?)
+                VALUES (?, ?, ?, NULL, datetime('now'), ?)
                 """,
-                (
-                    t["entity_id"],
-                    data.get("primary_phone"),
-                    data.get("primary_email"),
-                    data.get("llc_authorized_agent"),
-                    data.get("confidence"),
-                ),
+                (t["entity_id"], primary_phone, primary_email, confidence),
             )
             conn.commit()
-        enriched += 1
+        matched += 1
+        if primary_phone: with_phone += 1
+        if primary_email: with_email += 1
 
-    _emit(agent, True, {"enriched": enriched}, meta={"limit": limit})
+    _emit(agent, True,
+          {"targets": len(targets), "attempted": attempted, "matched": matched,
+           "with_phone": with_phone, "with_email": with_email,
+           "unparseable_addrs": unparseable, "errors": errors[:10]},
+          meta={"limit": limit})
 
 
 @main.command("dedup")
@@ -1666,11 +1744,14 @@ def _post_tranchi_cash_buyers(payload: list[dict], token: str, timeout: float = 
               help="records per POST (server accepts arrays)")
 @click.option("--include-cold", is_flag=True,
               help="also include cold/dormant tiers (default: hot+warm only)")
+@click.option("--has-contact", is_flag=True,
+              help="only push buyers with a phone or email in buyer_contacts")
 @click.option("--dry-run", is_flag=True,
               help="build the payload but skip the POST; prints the first batch")
 @click.option("--agent", is_flag=True)
 def cmd_push_tranchi(top: int, market: str | None, batch_size: int,
-                     include_cold: bool, dry_run: bool, agent: bool) -> None:
+                     include_cold: bool, has_contact: bool,
+                     dry_run: bool, agent: bool) -> None:
     """POST qualified buyers to tranchi.ai/api/cash_buyers.
 
     Direct HTTPS POST with Bearer auth (TRANCHI_TOKEN from env or
@@ -1694,6 +1775,8 @@ def cmd_push_tranchi(top: int, market: str | None, batch_size: int,
     if market:
         where.append("EXISTS (SELECT 1 FROM cash_sales cs WHERE cs.entity_id = be.entity_id AND cs.market = ?)")
         params.append(market)
+    if has_contact:
+        where.append("(bc.primary_phone IS NOT NULL OR bc.primary_email IS NOT NULL)")
     params.append(top)
 
     sql = f"""
@@ -1716,21 +1799,21 @@ def cmd_push_tranchi(top: int, market: str | None, batch_size: int,
         rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
 
         def build_record(r: dict) -> dict:
+            markets = [m.strip() for m in (r.get("markets_csv") or "").split(",") if m.strip()]
             rec = {
                 "external_id":  r["entity_id"],
                 "name":         r["canonical_name"],
                 "source":       "cash-buyer-scraper",
+                "phone":        r.get("primary_phone"),
+                "email":        r.get("primary_email"),
+                "markets":      markets,
             }
-            if r.get("primary_phone"):           rec["phone"] = r["primary_phone"]
-            if r.get("primary_email"):           rec["email"] = r["primary_email"]
             if r.get("primary_mailing"):         rec["mailing_address"] = r["primary_mailing"]
             if r.get("entity_type"):             rec["entity_type"] = r["entity_type"]
             if r.get("velocity_12m") is not None: rec["velocity_12m"] = r["velocity_12m"]
             if r.get("median_purchase_price"):   rec["median_purchase_price"] = r["median_purchase_price"]
             if r.get("property_type_mode"):      rec["property_type"] = r["property_type_mode"]
             if r.get("activity_tier"):           rec["activity_tier"] = r["activity_tier"]
-            if r.get("markets_csv"):
-                rec["markets"] = [m.strip() for m in r["markets_csv"].split(",") if m.strip()]
             return rec
 
         payload = [build_record(r) for r in rows]

@@ -13,6 +13,13 @@ dependencies = [
     "photo-enrichment-pipeline @ git+https://github.com/marcmunoz-uno/photo-enrichment-pipeline.git",
 ]
 
+[project.optional-dependencies]
+dispenser = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.5",
+]
+
 [project.scripts]
 cash-buyer-intel = "cash_buyer_intel.cli:main"
 
