@@ -417,6 +417,25 @@ cash-buyer-intel ingest-propstream \
 
 ## Status and roadmap
 
+**v0.16 — Payload aligned with the official Cash Buyer Pool Upload API spec.**
+- Tranchi team published `Cash Buyer Pool Upload API — Documentation.md` (root of this repo). Our previous payload had four field-name mismatches and was missing several fields critical for buyer surfacing.
+- Renamed: `markets` (array) → `market` (singular string), `median_purchase_price` → `median_price`, `property_type` → `property_type_mode`, `skip_trace_confidence` → `confidence`.
+- Added: `state` (required for state-fallback matching), `p25_price` / `p75_price` (property price-band ±30% filter), `recency_score`, `velocity_3m`, `total_sales`, `llc_agent`, `zip_cluster_lat/lon/radius`.
+- Wire format: `_post_tranchi_cash_buyers` now wraps batches in `{"buyers": [...]}` (spec-recommended for batches; raw array + single object also accepted by the endpoint).
+- The dispenser's `/api/dispense` response shape mirrors `build_record` exactly — consumers see the same fields whether they pull from us on-demand or receive a row pushed via `push-tranchi`.
+- **Known follow-up:** `recency_score` spec range is 0–1; our count-based fallback can emit >1 when BatchData core doesn't return sale dates. Sort works DESC either way, but normalize in `score_all()` as a v0.17.
+
+**v0.15 — On-demand cash-buyer dispenser HTTP service.**
+- New `cash_buyer_intel/dispenser/` FastAPI package with the per-user, on-demand pull surface for tranchi.ai's "Get Cash Buyers" front-end button. Tranchi's backend POSTs a request with `(user_id, market, quantity)`; we serve cache-bearing rows immediately and kick off an async BatchData fetch for any shortfall.
+- Endpoints: `POST /api/dispense`, `GET /api/dispense/jobs/{id}`, `GET /api/dispense/stock`, `GET /api/dispense/history`, `GET /healthz`. Auto-generated Swagger UI at `/docs`.
+- Bearer-token auth via `DISPENSER_TOKEN` (env or `~/.openclaw/.env`). UNIQUE `(user_id, entity_id)` constraint enforces no-double-dispense per user. SQL hard-filters to `bc.primary_phone IS NOT NULL OR bc.primary_email IS NOT NULL` — only rows with real skip-traced contact data; no fabricated payloads.
+- New CLI: `cash-buyer-intel serve [--host --port]` (wraps uvicorn). New optional install group `pip install -e ".[dispenser]"`.
+- New tables: `dispenses` (one row per buyer-to-user dispatch) + `dispense_jobs` (async fulfillment queue). Both auto-created on `init-db`.
+- Cost model: cache hits = $0; fresh BatchData fetches = $0.077 per fully-enriched record (observed yield 2026-05-26: $50 → 652 records with both phone + email). Dispenser reports `cost_usd` per record; caller (Tranchi) applies markup via their existing Stripe.
+- Fixed `enrich-batchdata` — previous version was silently broken (passed `--address` which doesn't exist on the BatchData CLI; parsed `data.primary_phone` but the API returns `data.results.persons[].phoneNumbers[].number`). Now uses `--requests` JSON, picks best non-DNC phone by score, prefers tested emails, surfaces real errors.
+- Fixed `push-tranchi` — new `--has-contact` flag filters to rows with phone OR email so we only ship contact-bearing buyers.
+- Full contract in `docs/dispenser.md`.
+
 **v0.14 — Zillow PDP re-scrape upgrades 577 Street-View records → listing-CDN photos.**
 - New command `upgrade-photos-zillow` — for rows whose `image_urls` JSON contains zero listing-CDN URLs (i.e. only Street View + Esri fallbacks), re-scrapes the Zillow PDP via BrightData and replaces the row with just the `photos.zillowstatic.com` gallery URLs.
 - Live run on the 3,068-record non-listing cohort: **577 upgraded (19% hit rate), 2,304 had no Zillow listing (off-market / never-listed), 187 fetch failed.** At ~$0.001/scrape ≈ **$3 total cost**.
