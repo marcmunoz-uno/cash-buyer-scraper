@@ -25,6 +25,7 @@ venv/
 # Secrets
 .env
 .env.*
+!.env.example
 .secrets/
 *.token
 api_token
