@@ -149,6 +149,9 @@ git clone git@github.com:marcmunoz-uno/cash-buyer-scraper.git
 cd cash-buyer-scraper
 python3.12 -m venv .venv && .venv/bin/pip install -e .
 
+# (optional, but recommended) configure tokens — see .env.example for the full list
+cp .env.example .env       # then fill in TRANCHI_TOKEN / BATCHDATA / etc.
+
 # initialize the local buyers DB
 cash-buyer-intel init-db
 
