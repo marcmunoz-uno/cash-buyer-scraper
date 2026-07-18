@@ -1747,12 +1747,15 @@ def _post_tranchi_cash_buyers(payload: list[dict], token: str, timeout: float = 
               help="also include cold/dormant tiers (default: hot+warm only)")
 @click.option("--has-contact", is_flag=True,
               help="only push buyers with a phone or email in buyer_contacts")
+@click.option("--skip-pushed", is_flag=True,
+              help="exclude buyers already pushed to Tranchi (logged in buyer_outreach "
+                   "channel='tranchi_push') — pushes only NEW entities, avoids re-upserting")
 @click.option("--dry-run", is_flag=True,
               help="build the payload but skip the POST; prints the first batch")
 @click.option("--agent", is_flag=True)
 def cmd_push_tranchi(top: int, market: str | None, batch_size: int,
                      include_cold: bool, has_contact: bool,
-                     dry_run: bool, agent: bool) -> None:
+                     skip_pushed: bool, dry_run: bool, agent: bool) -> None:
     """POST qualified buyers to tranchi.ai/api/cash_buyers.
 
     Direct HTTPS POST with Bearer auth (TRANCHI_TOKEN from env or
@@ -1778,6 +1781,9 @@ def cmd_push_tranchi(top: int, market: str | None, batch_size: int,
         params.append(market)
     if has_contact:
         where.append("(bc.primary_phone IS NOT NULL OR bc.primary_email IS NOT NULL)")
+    if skip_pushed:
+        where.append("be.entity_id NOT IN "
+                     "(SELECT entity_id FROM buyer_outreach WHERE channel='tranchi_push')")
     params.append(top)
 
     # SQL aligns with the field mapping in the Cash Buyer Pool Upload API doc.
@@ -1850,6 +1856,14 @@ def cmd_push_tranchi(top: int, market: str | None, batch_size: int,
                 v = r.get(k_src)
                 if v is not None and v != "":
                     rec[k_api] = v
+            # Cap string fields to the receiver's column widths. cash_buyer_pool
+            # does per-row inserts but 500s the whole batch if one row overflows
+            # a column — propertyTypeMode is varchar(50), market varchar(100),
+            # name varchar(300), source/state small. Truncate defensively.
+            for fld, width in (("property_type_mode", 50), ("market", 100),
+                               ("name", 300), ("source", 50), ("state", 2)):
+                if rec.get(fld):
+                    rec[fld] = str(rec[fld])[:width]
             return rec
 
         payload = [build_record(r) for r in rows]
@@ -1878,7 +1892,17 @@ def cmd_push_tranchi(top: int, market: str | None, batch_size: int,
             try:
                 resp = _post_tranchi_cash_buyers(batch, token)
             except urllib.error.HTTPError as e:
-                transport_errors.append(f"batch {start}-{start+len(batch)}: HTTP {e.code} — {e.read()[:200].decode('utf-8', 'replace')}")
+                body = e.read()[:300].decode('utf-8', 'replace')
+                transport_errors.append(f"batch {start}-{start+len(batch)}: HTTP {e.code} — {body}")
+                if e.code == 429:
+                    # Rate-limited: stop hammering. The remaining records sort
+                    # after this offset; push them in the next window (re-run
+                    # with --skip-pushed to resume without re-upserting).
+                    remaining = len(payload) - start
+                    transport_errors.append(
+                        f"RATE LIMITED at offset {start}/{len(payload)} — stopped; "
+                        f"{remaining} records not sent this window. Re-run with --skip-pushed after cooldown.")
+                    break
                 continue
             except (urllib.error.URLError, OSError) as e:
                 transport_errors.append(f"batch {start}-{start+len(batch)}: transport error — {e}")
