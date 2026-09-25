@@ -59,8 +59,12 @@ def normalize_address(addr: str) -> str:
     return " ".join(s.split())
 
 
+# `l\s+l\s+c` catches the spaced single-letter rendering ("SMITH HOLDINGS L L C")
+# that deed records often use for an LLC. Without it that alias normalizes to a
+# different key than "SMITH HOLDINGS LLC" and the same buyer splits into two
+# entities. Matches the " L L C" tag that _guess_entity_type already treats as an LLC.
 _LLC_SUFFIXES = re.compile(
-    r"\b(l\.?l\.?c\.?|inc\.?|incorporated|corp\.?|corporation|trust|ltd\.?|llp|lp|co\.?|company)\b",
+    r"\b(l\.?l\.?c\.?|l\s+l\s+c|inc\.?|incorporated|corp\.?|corporation|trust|ltd\.?|llp|lp|co\.?|company)\b",
     re.IGNORECASE,
 )
 

@@ -69,9 +69,15 @@ def _row_to_buyer(r: sqlite3.Row) -> dict[str, Any]:
 def cache_stock(market: str, user_id: str) -> int:
     """How many contact-bearing buyers we could dispense to this user right
     now from cache for this market. Used by the API to set expectations."""
+    # Must mirror dispense_from_cache's eligibility exactly, or /stock promises
+    # buyers the dispenser can't deliver. dispense_from_cache INNER JOINs
+    # buyer_scores (it needs recency_score to rank and ship), so an entity with
+    # a contact + cash_sale but no score row is NOT dispensable and must not be
+    # counted here.
     sql = """
     SELECT COUNT(*) FROM buyer_entities be
       JOIN buyer_contacts bc ON bc.entity_id = be.entity_id
+      JOIN buyer_scores   bs ON bs.entity_id = be.entity_id
      WHERE (bc.primary_phone IS NOT NULL OR bc.primary_email IS NOT NULL)
        AND EXISTS (SELECT 1 FROM cash_sales cs
                     WHERE cs.entity_id = be.entity_id AND cs.market = ?)

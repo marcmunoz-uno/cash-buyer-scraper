@@ -19,6 +19,9 @@ dispenser = [
     "uvicorn[standard]>=0.27",
     "pydantic>=2.5",
 ]
+dev = [
+    "pytest>=7",
+]
 
 [project.scripts]
 cash-buyer-intel = "cash_buyer_intel.cli:main"

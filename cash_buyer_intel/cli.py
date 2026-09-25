@@ -784,6 +784,58 @@ def cmd_enrich_photos(source_table: str, market: str | None, limit: int, min_pho
           meta={"source_table": source_table, "market": market, "target_photos": target_photos})
 
 
+def _select_push_lead_candidates(conn, *, source_table: str, market: str | None,
+                                 min_photos: int, limit: int) -> list[dict]:
+    """Rows eligible to push to tranchi: photo-qualified and not already pushed
+    SUCCESSFULLY.
+
+    The push-log filter only excludes addresses whose prior push succeeded
+    (response_status = 'ok'). A prior *failed* push must not permanently
+    suppress a retry, and a row that was never actually sent (e.g. skipped for
+    a missing price) must stay a candidate for a later run once it is enriched.
+    """
+    alias = "m" if source_table == "motivated_sellers" else "cs"
+    photo_join = "LEFT JOIN" if min_photos == 0 else "JOIN"
+    where = "1=1" if min_photos == 0 else "COALESCE(p.photo_count, 0) >= ?"
+    params: list = [] if min_photos == 0 else [min_photos]
+    if market:
+        where += f" AND {alias}.market = ?"
+        params.append(market)
+
+    if source_table == "motivated_sellers":
+        sql = f"""
+            SELECT m.lead_id AS row_id, m.property_address AS address, m.city, m.state,
+                   m.zip_code AS zip, m.lead_type AS deal_type,
+                   m.owner_name_raw, m.owner_mailing_addr,
+                   m.est_value, m.last_sale_amount,
+                   p.image_urls, COALESCE(p.photo_count, 0) AS photo_count,
+                   m.property_address_norm AS address_norm
+              FROM motivated_sellers m
+        {photo_join} property_photos p ON p.address_norm = m.property_address_norm
+         LEFT JOIN tranchi_push_log tpl
+                ON tpl.address_norm = m.property_address_norm AND tpl.response_status = 'ok'
+             WHERE {where} AND tpl.address_norm IS NULL
+             LIMIT ?
+        """
+    else:
+        sql = f"""
+            SELECT cs.sale_id AS row_id, cs.property_address AS address, cs.city, cs.state,
+                   cs.zip_code AS zip, 'cash_buyer' AS deal_type,
+                   cs.buyer_name_raw AS owner_name_raw, cs.buyer_mailing_addr AS owner_mailing_addr,
+                   NULL AS est_value, cs.sale_price AS last_sale_amount,
+                   p.image_urls, COALESCE(p.photo_count, 0) AS photo_count,
+                   cs.property_address_norm AS address_norm
+              FROM cash_sales cs
+        {photo_join} property_photos p ON p.address_norm = cs.property_address_norm
+         LEFT JOIN tranchi_push_log tpl
+                ON tpl.address_norm = cs.property_address_norm AND tpl.response_status = 'ok'
+             WHERE {where} AND tpl.address_norm IS NULL
+             LIMIT ?
+        """
+    params.append(limit)
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
 @main.command("push-tranchi-leads")
 @click.option("--source-table", type=click.Choice(["motivated_sellers", "cash_sales"]),
               default="motivated_sellers")
@@ -800,45 +852,11 @@ def cmd_push_tranchi_leads(source_table: str, market: str | None, limit: int,
     Skips rows without ≥min-photos photos (Tranchi silently drops short image
     arrays). Writes the response to tranchi_push_log.
     """
-    # Photos optional when min_photos == 0 (LEFT JOIN); required (INNER) otherwise.
-    photo_join = "LEFT JOIN" if min_photos == 0 else "JOIN"
-    where = "1=1" if min_photos == 0 else "COALESCE(p.photo_count, 0) >= ?"
-    params: list = [] if min_photos == 0 else [min_photos]
-    if market:
-        where += " AND m.market = ?"
-        params.append(market)
-
     with open_buyers() as conn:
-        if source_table == "motivated_sellers":
-            sql = f"""
-                SELECT m.lead_id AS row_id, m.property_address AS address, m.city, m.state,
-                       m.zip_code AS zip, m.lead_type AS deal_type,
-                       m.owner_name_raw, m.owner_mailing_addr,
-                       m.est_value, m.last_sale_amount,
-                       p.image_urls, COALESCE(p.photo_count, 0) AS photo_count,
-                       m.property_address_norm AS address_norm
-                  FROM motivated_sellers m
-            {photo_join} property_photos p ON p.address_norm = m.property_address_norm
-             LEFT JOIN tranchi_push_log tpl ON tpl.address_norm = m.property_address_norm
-                 WHERE {where} AND tpl.address_norm IS NULL
-                 LIMIT ?
-            """
-        else:
-            sql = f"""
-                SELECT cs.sale_id AS row_id, cs.property_address AS address, cs.city, cs.state,
-                       cs.zip_code AS zip, 'cash_buyer' AS deal_type,
-                       cs.buyer_name_raw AS owner_name_raw, cs.buyer_mailing_addr AS owner_mailing_addr,
-                       NULL AS est_value, cs.sale_price AS last_sale_amount,
-                       p.image_urls, COALESCE(p.photo_count, 0) AS photo_count,
-                       cs.property_address_norm AS address_norm
-                  FROM cash_sales cs
-            {photo_join} property_photos p ON p.address_norm = cs.property_address_norm
-             LEFT JOIN tranchi_push_log tpl ON tpl.address_norm = cs.property_address_norm
-                 WHERE {where} AND tpl.address_norm IS NULL
-                 LIMIT ?
-            """
-        params.append(limit)
-        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+        rows = _select_push_lead_candidates(
+            conn, source_table=source_table, market=market,
+            min_photos=min_photos, limit=limit,
+        )
 
     if not rows:
         _emit(agent, True, {"pushed": 0, "skipped": "no candidates with ≥5 photos"}); return
@@ -899,11 +917,17 @@ def cmd_push_tranchi_leads(source_table: str, market: str | None, limit: int,
     except FileNotFoundError:
         _emit(agent, False, None, errors=["tranchi-pp-cli not found"]); return
 
-    # Log every push, success or fail
+    # Log every push, success or fail — but only the rows we actually sent.
+    # Rows dropped above (no price / no listing photos) were never pushed, so
+    # logging them would mark them "pushed" and permanently exclude them from a
+    # later run once they are enriched.
     response_status = "ok" if proc.returncode == 0 else "error"
     response_body = (proc.stdout or "") + (proc.stderr or "")
+    pushed_row_ids = {lead["external_id"] for lead in leads}
     with open_buyers() as conn:
         for r in rows:
+            if r["row_id"] not in pushed_row_ids:
+                continue
             conn.execute(
                 """
                 INSERT INTO tranchi_push_log
